@@ -22,7 +22,7 @@ import (
 
 const (
 	// The size of the column indicies in parquet files.
-	ColumnIndexSize = 16
+	ColumnIndexSize = 100
 )
 
 // ColumnDefinition describes a column in a dynamic parquet schema.
