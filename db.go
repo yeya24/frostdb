@@ -586,6 +586,10 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 				if ok {
 					delete(db.roTables, tableName)
 					table.config = config
+					table.schema, err = schemaFromTableConfig(config)
+					if err != nil {
+						return err
+					}
 				} else {
 					table, err = newTable(
 						db,
