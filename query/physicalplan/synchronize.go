@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v10/arrow"
+	"github.com/apache/arrow/go/v17/arrow"
 )
 
 // Synchronizer is used to combine the results of multiple parallel streams
@@ -17,12 +17,15 @@ type Synchronizer struct {
 	next    PhysicalPlan
 	nextMtx sync.Mutex
 	running *atomic.Int64
+	open    *atomic.Int64
 }
 
 func Synchronize(concurrency int) *Synchronizer {
 	running := &atomic.Int64{}
 	running.Add(int64(concurrency))
-	return &Synchronizer{running: running}
+	open := &atomic.Int64{}
+	open.Add(int64(concurrency))
+	return &Synchronizer{running: running, open: open}
 }
 
 func (m *Synchronizer) Callback(ctx context.Context, r arrow.Record) error {
@@ -59,4 +62,15 @@ func (m *Synchronizer) SetNextPlan(nextPlan PhysicalPlan) {
 
 func (m *Synchronizer) Draw() *Diagram {
 	return &Diagram{Details: "Synchronizer", Child: m.next.Draw()}
+}
+
+func (m *Synchronizer) Close() {
+	open := m.open.Add(-1)
+	if open < 0 {
+		panic("too many Synchronizer Close calls")
+	}
+	if open > 0 {
+		return
+	}
+	m.next.Close()
 }

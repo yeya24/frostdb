@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/pqarrow/builder"
 	"github.com/polarsignals/frostdb/query/logicalplan"
@@ -165,7 +166,7 @@ func TestOrderedAggregate(t *testing.T) {
 			valBuilder := builder.NewOptInt64Builder(arrow.PrimitiveTypes.Int64)
 			o := NewOrderedAggregate(
 				memory.DefaultAllocator,
-				trace.NewNoopTracerProvider().Tracer(""),
+				noop.NewTracerProvider().Tracer(""),
 				Aggregation{
 					expr:       logicalplan.Col(valColName),
 					resultName: "result",
@@ -176,7 +177,7 @@ func TestOrderedAggregate(t *testing.T) {
 			)
 			resultCursor := 0
 			o.SetNext(&OutputPlan{
-				callback: func(ctx context.Context, r arrow.Record) error {
+				callback: func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						require.True(t, resultCursor < len(tc.resultRecords))
 						return nil
@@ -272,7 +273,7 @@ func TestOrderedAggregateDynCols(t *testing.T) {
 	ctx := context.Background()
 	o := NewOrderedAggregate(
 		memory.DefaultAllocator,
-		trace.NewNoopTracerProvider().Tracer(""),
+		noop.NewTracerProvider().Tracer(""),
 		Aggregation{
 			expr:     logicalplan.Col(valColName),
 			function: logicalplan.AggFuncSum,

@@ -52,3 +52,28 @@ func TestDynamicColumnsDeserialization_NoDynamicColumns(t *testing.T) {
 	expected := map[string][]string{}
 	require.Equal(t, expected, output)
 }
+
+func BenchmarkDeserialization(b *testing.B) {
+	input := "labels:__name__;pprof_labels:;pprof_num_labels:bytes"
+	for i := 0; i < b.N; i++ {
+		_, _ = deserializeDynamicColumns(input)
+	}
+}
+
+func BenchmarkSerialize(b *testing.B) {
+	input := map[string][]string{
+		"labels": {
+			"container",
+			"namespace",
+			"node",
+			"pod",
+		},
+		"pprof_labels": {
+			"profile_id",
+		},
+	}
+
+	for i := 0; i < b.N; i++ {
+		_ = serializeDynamicColumns(input)
+	}
+}

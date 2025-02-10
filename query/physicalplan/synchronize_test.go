@@ -5,9 +5,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
 )
 
@@ -32,7 +32,7 @@ func TestSynchronize(t *testing.T) {
 	err := op.Execute(
 		context.Background(),
 		memory.NewGoAllocator(),
-		func(ctx context.Context, r arrow.Record) error {
+		func(_ context.Context, _ arrow.Record) error {
 			calls++
 			return nil
 		},

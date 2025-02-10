@@ -4,10 +4,11 @@ import (
 	"context"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/query/logicalplan"
@@ -21,26 +22,26 @@ func (m *mockTableReader) Schema() *dynparquet.Schema {
 	return m.schema
 }
 
-func (m *mockTableReader) View(ctx context.Context, fn func(ctx context.Context, tx uint64) error) error {
+func (m *mockTableReader) View(_ context.Context, _ func(ctx context.Context, tx uint64) error) error {
 	return nil
 }
 
 func (m *mockTableReader) Iterator(
-	ctx context.Context,
-	tx uint64,
-	pool memory.Allocator,
-	callbacks []logicalplan.Callback,
-	iterOpts ...logicalplan.Option,
+	_ context.Context,
+	_ uint64,
+	_ memory.Allocator,
+	_ []logicalplan.Callback,
+	_ ...logicalplan.Option,
 ) error {
 	return nil
 }
 
 func (m *mockTableReader) SchemaIterator(
-	ctx context.Context,
-	tx uint64,
-	pool memory.Allocator,
-	callbacks []logicalplan.Callback,
-	iterOpts ...logicalplan.Option,
+	_ context.Context,
+	_ uint64,
+	_ memory.Allocator,
+	_ []logicalplan.Callback,
+	_ ...logicalplan.Option,
 ) error {
 	return nil
 }
@@ -49,7 +50,7 @@ type mockTableProvider struct {
 	schema *dynparquet.Schema
 }
 
-func (m *mockTableProvider) GetTable(name string) (logicalplan.TableReader, error) {
+func (m *mockTableProvider) GetTable(_ string) (logicalplan.TableReader, error) {
 	return &mockTableReader{
 		schema: m.schema,
 	}, nil
@@ -60,10 +61,10 @@ func TestBuildPhysicalPlan(t *testing.T) {
 		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
 		Filter(logicalplan.Col("labels.test").Eq(logicalplan.Literal("abc"))).
 		Aggregate(
-			[]logicalplan.Expr{logicalplan.Sum(logicalplan.Col("value")).Alias("value_sum")},
+			[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
 			[]logicalplan.Expr{logicalplan.Col("stacktrace")},
 		).
-		Project(logicalplan.Col("stacktrace"), logicalplan.Col("value_sum")).
+		Project(logicalplan.Col("stacktrace"), logicalplan.Sum(logicalplan.Col("value")).Alias("value_sum")).
 		Build()
 
 	optimizers := []logicalplan.Optimizer{
@@ -78,7 +79,7 @@ func TestBuildPhysicalPlan(t *testing.T) {
 	_, err := Build(
 		context.Background(),
 		memory.DefaultAllocator,
-		trace.NewNoopTracerProvider().Tracer(""),
+		noop.NewTracerProvider().Tracer(""),
 		dynparquet.NewSampleSchema(),
 		p,
 	)
@@ -103,4 +104,8 @@ func (m *mockPhysicalPlan) SetNext(next PhysicalPlan) {
 
 func (m *mockPhysicalPlan) Draw() *Diagram {
 	return &Diagram{}
+}
+
+func (m *mockPhysicalPlan) Close() {
+	m.next.Close()
 }

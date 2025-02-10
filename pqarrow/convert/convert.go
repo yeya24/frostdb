@@ -3,9 +3,9 @@ package convert
 import (
 	"errors"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/segmentio/parquet-go"
-	"github.com/segmentio/parquet-go/format"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/format"
 
 	"github.com/polarsignals/frostdb/pqarrow/writer"
 )
@@ -65,7 +65,7 @@ func ParquetNodeToType(n parquet.Node) (arrow.DataType, error) {
 					fallthrough
 				case format.RLEDictionary:
 					dt = &arrow.DictionaryType{
-						IndexType: &arrow.Int16Type{}, // TODO: do we need more width?
+						IndexType: &arrow.Uint32Type{},
 						ValueType: &arrow.BinaryType{},
 					}
 				default:

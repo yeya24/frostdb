@@ -21,10 +21,10 @@ package builder
 import (
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/bitutil"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/bitutil"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 )
 
 const (
@@ -148,13 +148,6 @@ func (b *builder) unsafeSetValid(length int) {
 	}
 
 	b.length = newLength
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ListBuilder is a wrapper over an array.ListBuilder that uses ColumnBuilder as a values buffer.

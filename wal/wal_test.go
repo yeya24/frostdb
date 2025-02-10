@@ -1,12 +1,13 @@
 package wal
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	walpb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/wal/v1alpha1"
@@ -16,7 +17,6 @@ func TestWAL(t *testing.T) {
 	dir := t.TempDir()
 	w, err := Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		dir,
 	)
 	require.NoError(t, err)
@@ -37,7 +37,6 @@ func TestWAL(t *testing.T) {
 
 	w, err = Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		dir,
 	)
 	require.NoError(t, err)
@@ -68,7 +67,6 @@ func TestWAL(t *testing.T) {
 	require.NoError(t, os.RemoveAll(dir))
 	w, err = Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		dir,
 	)
 	require.NoError(t, err)
@@ -81,7 +79,6 @@ func TestCorruptWAL(t *testing.T) {
 
 	w, err := Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		path,
 	)
 	require.NoError(t, err)
@@ -105,7 +102,6 @@ func TestCorruptWAL(t *testing.T) {
 
 	w, err = Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		path,
 	)
 	require.NoError(t, err)
@@ -126,7 +122,6 @@ func TestUnexpectedTxn(t *testing.T) {
 	func() {
 		w, err := Open(
 			log.NewNopLogger(),
-			prometheus.NewRegistry(),
 			walDir,
 		)
 		require.NoError(t, err)
@@ -145,7 +140,6 @@ func TestUnexpectedTxn(t *testing.T) {
 	}()
 	w, err := Open(
 		log.NewNopLogger(),
-		prometheus.NewRegistry(),
 		walDir,
 	)
 	require.NoError(t, err)
@@ -154,4 +148,145 @@ func TestUnexpectedTxn(t *testing.T) {
 	lastIndex, err := w.LastIndex()
 	require.NoError(t, err)
 	require.Equal(t, lastIndex, uint64(2))
+}
+
+func TestWALTruncate(t *testing.T) {
+	logRecord := func(data string) *walpb.Record {
+		return &walpb.Record{
+			Entry: &walpb.Entry{
+				EntryType: &walpb.Entry_Write_{
+					Write: &walpb.Entry_Write{
+						Data:      []byte(data),
+						TableName: "test-table",
+					},
+				},
+			},
+		}
+	}
+	for i, tc := range []string{"BeforeLog", "AfterLog"} {
+		t.Run(tc, func(t *testing.T) {
+			dir := t.TempDir()
+			w, err := Open(
+				log.NewNopLogger(),
+				dir,
+			)
+			require.NoError(t, err)
+			defer w.Close()
+			w.RunAsync()
+
+			for j := uint64(1); j < 10; j++ {
+				require.NoError(t, w.Log(j, logRecord(fmt.Sprintf("test-data-%d", j))))
+			}
+			if i == 1 {
+				// Wait until the last entry is written before issuing the
+				// truncate call.
+				require.Eventually(t, func() bool {
+					tx, _ := w.LastIndex()
+					return tx == 9
+				}, time.Second, 10*time.Millisecond)
+			}
+			require.NoError(t, w.Truncate(9))
+
+			// Wait for the WAL to asynchronously log and truncate.
+			require.Eventually(t, func() bool {
+				tx, _ := w.FirstIndex()
+				return tx == 9
+			}, time.Second, 10*time.Millisecond)
+
+			numRecords := 0
+			require.NoError(
+				t,
+				w.Replay(0, func(tx uint64, r *walpb.Record) error {
+					numRecords++
+					require.Equal(t, uint64(9), tx)
+					require.Equal(t, []byte("test-data-9"), r.Entry.GetWrite().Data)
+					return nil
+				}),
+			)
+			require.Equal(t, 1, numRecords)
+		})
+	}
+
+	t.Run("Reset", func(t *testing.T) {
+		dir := t.TempDir()
+		w, err := Open(
+			log.NewNopLogger(),
+			dir,
+		)
+		require.NoError(t, err)
+		defer w.Close()
+		w.RunAsync()
+
+		for i := uint64(1); i < 10; i++ {
+			require.NoError(t, w.Log(i, logRecord("test-data-%d")))
+		}
+
+		// Truncate way past the current last index, which should be 9.
+		const truncateIdx = 20
+		require.NoError(t, w.Truncate(truncateIdx))
+
+		require.Eventually(t, func() bool {
+			first, _ := w.FirstIndex()
+			last, _ := w.LastIndex()
+			return first == 0 && last == 0
+		}, time.Second, 10*time.Millisecond)
+
+		// Even though the WAL has been reset, we should not allow logging a
+		// record with a txn lower than the last truncation. This will only
+		// be observed on replay.
+		require.NoError(t, w.Log(1, logRecord("should-not-be-logged")))
+
+		// The only valid record to log is truncateIdx. Note that Truncate
+		// semantics are that Truncate truncates up to but not including the
+		// truncateIdx. In other words, truncateIdx becomes the first entry in
+		// the WAL.
+		require.NoError(t, w.Log(truncateIdx, logRecord("should-be-logged")))
+
+		// Wait for record to be logged.
+		require.Eventually(t, func() bool {
+			first, _ := w.FirstIndex()
+			last, _ := w.LastIndex()
+			return first == truncateIdx && last == truncateIdx
+		}, time.Second, 10*time.Millisecond)
+
+		numRecords := 0
+		require.NoError(
+			t,
+			w.Replay(0, func(tx uint64, r *walpb.Record) error {
+				numRecords++
+				require.Equal(t, uint64(truncateIdx), tx)
+				require.Equal(t, []byte("should-be-logged"), r.Entry.GetWrite().Data)
+				return nil
+			}),
+		)
+		require.Equal(t, 1, numRecords)
+	})
+}
+
+func TestWALCloseTimeout(t *testing.T) {
+	dir := t.TempDir()
+	w, err := Open(
+		log.NewNopLogger(),
+		dir,
+	)
+	require.NoError(t, err)
+
+	w.RunAsync()
+
+	// This will cause the WAL to enter a state where it will not close
+	// b/c it was expecting the next transaction to be 1.
+	require.NoError(t, w.Log(2, &walpb.Record{
+		Entry: &walpb.Entry{
+			EntryType: &walpb.Entry_Write_{
+				Write: &walpb.Entry_Write{
+					Data:      []byte("test-data"),
+					TableName: "test-table",
+				},
+			},
+		},
+	}))
+
+	// This should not block forever, otherwise the test will fail by timeout
+	err = w.Close()
+	require.NoError(t, err)
 }

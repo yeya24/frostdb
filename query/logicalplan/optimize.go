@@ -1,86 +1,32 @@
 package logicalplan
 
-import (
-	"golang.org/x/exp/slices"
-)
+var hashedMatch = "hashed"
 
 type Optimizer interface {
 	Optimize(plan *LogicalPlan) *LogicalPlan
 }
 
-var DefaultOptimizers = []Optimizer{
-	&AverageAggregationPushDown{},
-	&PhysicalProjectionPushDown{},
-	&FilterPushDown{},
-	&DistinctPushDown{},
-	&ProjectionPushDown{},
-}
-
-type AverageAggregationPushDown struct{}
-
-func (p *AverageAggregationPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
-	if plan.Aggregation == nil {
-		return plan
-	}
-
-	for i, aggExpr := range plan.Aggregation.AggExprs {
-		var aggFunc *AggregationFunction
-		var alias *AliasExpr
-		var column Expr
-
-		// In case the aggregation contains an alias
-		if aliasExpr, ok := aggExpr.(*AliasExpr); ok {
-			alias = aliasExpr
-			if af, ok := aliasExpr.Expr.(*AggregationFunction); ok {
-				if af.Func == AggFuncAvg {
-					column = af.Expr
-					aggFunc = af
-				}
-			}
-		}
-		if ae, ok := aggExpr.(*AggregationFunction); ok {
-			if ae.Func == AggFuncAvg {
-				column = ae.Expr
-				aggFunc = ae
-			}
-		}
-
-		if aggFunc == nil {
-			// no aggregation func found, skipping
-			continue
-		}
-
-		// Delete this average aggregation from the logicalplan.
-		plan.Aggregation.AggExprs = slices.Delete(plan.Aggregation.AggExprs, i, i+1)
-		// Add sum and count aggregation for the column to the logicalplan.
-		plan.Aggregation.AggExprs = append(plan.Aggregation.AggExprs,
-			Sum(aggFunc.Expr),
-			Count(aggFunc.Expr),
-		)
-
-		projection := &AverageExpr{Expr: column}
-		if alias != nil {
-			alias.Expr = column
-			projection.Expr = alias
-		}
-
-		// Wrap the aggregations with the average projection to always call it after aggregating.
-		plan = &LogicalPlan{
-			Input: plan,
-			Projection: &Projection{
-				Exprs: []Expr{projection},
+func DefaultOptimizers() []Optimizer {
+	return []Optimizer{
+		&PhysicalProjectionPushDown{
+			defaultProjections: []Expr{
+				Not(DynCol(hashedMatch)),
 			},
-		}
+		},
+		&FilterPushDown{},
+		&DistinctPushDown{},
+		&AggFuncPushDown{},
 	}
-
-	return plan
 }
 
-// The PhysicalProjectionPushDown optimizer tries to push down the actual
-// physical columns used by the query to the table scan, so the table provider
-// can decide to only read the columns that are actually going to be used by
-// the query.
-type PhysicalProjectionPushDown struct{}
+// PhysicalProjectionPushDown finds the first projecting logical plan and
+// collects all columns it needs, it is concatenated with all other columns
+// used until it, for example a filter layer. Because the tree has the scan
+// layer as the inner most layer, the logic actually works by resetting the
+// list every time a projecting layer is found.
+type PhysicalProjectionPushDown struct {
+	defaultProjections []Expr
+}
 
 func (p *PhysicalProjectionPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
 	p.optimize(plan, nil)
@@ -90,26 +36,35 @@ func (p *PhysicalProjectionPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
 func (p *PhysicalProjectionPushDown) optimize(plan *LogicalPlan, columnsUsedExprs []Expr) {
 	switch {
 	case plan.SchemaScan != nil:
-		plan.SchemaScan.PhysicalProjection = columnsUsedExprs
+		plan.SchemaScan.PhysicalProjection = append(p.defaultProjections, columnsUsedExprs...)
 	case plan.TableScan != nil:
-		plan.TableScan.PhysicalProjection = columnsUsedExprs
+		plan.TableScan.PhysicalProjection = append(p.defaultProjections, columnsUsedExprs...)
 	case plan.Filter != nil:
+		p.defaultProjections = []Expr{}
 		columnsUsedExprs = append(columnsUsedExprs, plan.Filter.Expr.ColumnsUsedExprs()...)
 	case plan.Distinct != nil:
+		// distinct is projecting so we need to reset
+		columnsUsedExprs = []Expr{}
 		for _, expr := range plan.Distinct.Exprs {
 			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
 		}
 	case plan.Projection != nil:
+		// projections are is projecting so we need to reset
+		columnsUsedExprs = []Expr{}
 		for _, expr := range plan.Projection.Exprs {
 			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
 		}
 	case plan.Aggregation != nil:
+		// aggregations are projecting so we need to reset
+		columnsUsedExprs = []Expr{}
 		for _, expr := range plan.Aggregation.GroupExprs {
 			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
 		}
 		for _, expr := range plan.Aggregation.AggExprs {
 			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
 		}
+		p.defaultProjections = []Expr{}
+		columnsUsedExprs = append(columnsUsedExprs, DynCol(hashedMatch))
 	}
 
 	if plan.Input != nil {
@@ -117,154 +72,7 @@ func (p *PhysicalProjectionPushDown) optimize(plan *LogicalPlan, columnsUsedExpr
 	}
 }
 
-// The ProjectionPushDown finds the projection expressions that can be pushed
-// down. If there is no projection expression, but there is an implicit
-// projection such as a `Distinct` query plan, then it will insert a new
-// projection plan and push it down. It functions in three steps, first it will
-// find the projection expressions in the plan, then remove explicit projection
-// plans from the overall plan if it exists, and will then synthesize one if it
-// doesn't exist, and insert it in the deepest possible position in the plan.
-type ProjectionPushDown struct{}
-
-func (p *ProjectionPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
-	// Don't perform the optimization if filters or aggregations contain a column that projections do not.
-	// Otherwise we'll removed the columns we're filtering/aggregating.
-	projectColumns := projectionColumns(plan)
-	projectMap := map[string]bool{}
-	filterColumns := filterColumns(plan)
-	aggColumns := aggregationColumns(plan)
-	for _, m := range projectColumns {
-		projectMap[m.Name()] = true
-	}
-	for _, m := range filterColumns {
-		if !projectMap[m.Name()] {
-			return plan
-		}
-	}
-	for _, m := range aggColumns {
-		if !projectMap[m.Name()] {
-			return plan
-		}
-	}
-
-	c := &projectionCollector{}
-	c.collect(plan)
-
-	if len(c.projections) == 0 {
-		// If there are no projection expressions, then we don't need to do
-		// anything.
-		return plan
-	}
-
-	plan = removeProjection(plan)
-	return insertProjection(plan, &Projection{Exprs: c.projections})
-}
-
-type projectionCollector struct {
-	projections []Expr
-}
-
-func (p *projectionCollector) collect(plan *LogicalPlan) {
-	switch {
-	case plan.Distinct != nil:
-		p.projections = append(p.projections, plan.Distinct.Exprs...)
-	case plan.Projection != nil:
-		p.projections = append(p.projections, plan.Projection.Exprs...)
-	}
-
-	if plan.Input != nil {
-		p.collect(plan.Input)
-	}
-}
-
-// filterColumns returns all the column matchers for filters in a given plan.
-func filterColumns(plan *LogicalPlan) []Expr {
-	if plan == nil {
-		return nil
-	}
-
-	columnsUsedExprs := []Expr{}
-	switch {
-	case plan.Filter != nil:
-		columnsUsedExprs = append(columnsUsedExprs, plan.Filter.Expr.ColumnsUsedExprs()...)
-	}
-
-	return append(columnsUsedExprs, filterColumns(plan.Input)...)
-}
-
-func aggregationColumns(plan *LogicalPlan) []Expr {
-	if plan == nil {
-		return nil
-	}
-
-	columnsUsedExprs := []Expr{}
-	switch {
-	case plan.Aggregation != nil:
-		for _, expr := range plan.Aggregation.GroupExprs {
-			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
-		}
-		for _, expr := range plan.Aggregation.AggExprs {
-			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
-		}
-	}
-
-	return append(columnsUsedExprs, aggregationColumns(plan.Input)...)
-}
-
-// projectionColumns returns all the column matchers for projections in a given plan.
-func projectionColumns(plan *LogicalPlan) []Expr {
-	if plan == nil {
-		return nil
-	}
-
-	columnsUsedExprs := []Expr{}
-	switch {
-	case plan.Projection != nil:
-		for _, expr := range plan.Projection.Exprs {
-			columnsUsedExprs = append(columnsUsedExprs, expr.ColumnsUsedExprs()...)
-		}
-	}
-
-	return append(columnsUsedExprs, projectionColumns(plan.Input)...)
-}
-
-func removeProjection(plan *LogicalPlan) *LogicalPlan {
-	if plan == nil {
-		return nil
-	}
-
-	switch {
-	case plan.Projection != nil:
-		return plan.Input
-	}
-
-	plan.Input = removeProjection(plan.Input)
-	return plan
-}
-
-func insertProjection(cur *LogicalPlan, projection *Projection) *LogicalPlan {
-	if cur == nil {
-		return nil
-	}
-
-	switch {
-	case cur.TableScan != nil:
-		return &LogicalPlan{
-			Input:      cur,
-			Projection: projection,
-		}
-	case cur.SchemaScan != nil:
-		return &LogicalPlan{
-			Input:      cur,
-			Projection: projection,
-		}
-	}
-
-	cur.Input = insertProjection(cur.Input, projection)
-	return cur
-}
-
-// The FilterPushDown optimizer tries to push down the filters of a query down
+// FilterPushDown optimizer tries to push down the filters of a query down
 // to the actual physical table scan. This allows the table provider to make
 // smarter decisions about which pieces of data to load in the first place or
 // which are definitely not useful to the query at all. It does not guarantee
@@ -296,7 +104,7 @@ func (p *FilterPushDown) optimize(plan *LogicalPlan, exprs []Expr) {
 	}
 }
 
-// The DistinctPushDown optimizer tries to push down the distinct operator to
+// DistinctPushDown optimizer tries to push down the distinct operator to
 // the table provider. There are certain cases of distinct queries where the
 // storage engine can make smarter decisions than just returning all the data,
 // such as with dictionary encoded columns that are not filtered they can
@@ -309,6 +117,20 @@ func (p *DistinctPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
 	return plan
 }
 
+func exprsEqual(a, b []Expr) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i, expr := range a {
+		if !expr.Equal(b[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
 func (p *DistinctPushDown) optimize(plan *LogicalPlan, distinctColumns []Expr) {
 	switch {
 	case plan.TableScan != nil:
@@ -317,9 +139,55 @@ func (p *DistinctPushDown) optimize(plan *LogicalPlan, distinctColumns []Expr) {
 		}
 	case plan.Distinct != nil:
 		distinctColumns = append(distinctColumns, plan.Distinct.Exprs...)
+	case plan.Projection != nil:
+		if !exprsEqual(distinctColumns, plan.Projection.Exprs) {
+			// if and only if the distinct columns are identical to the
+			// projection columns we can perform the optimization, so we need
+			// to reset it in this case.
+			distinctColumns = []Expr{}
+		}
+	default:
+		// reset distinct columns
+		distinctColumns = []Expr{}
 	}
 
 	if plan.Input != nil {
 		p.optimize(plan.Input, distinctColumns)
+	}
+}
+
+// AggFuncPushDown optimizer tries to push down an aggregation function operator
+// to the table provider. This can be done in the case of some aggregation
+// functions on global aggregations (i.e. no group by) without filters.
+// The storage engine can make smarter decisions than just returning all the
+// data, such as in the case of max functions, memoizing the max value seen
+// so far and only scanning row groups that contain a value greater than the
+// memoized value. It modifies the plan in place.
+type AggFuncPushDown struct{}
+
+func (p *AggFuncPushDown) Optimize(plan *LogicalPlan) *LogicalPlan {
+	p.optimize(plan, nil)
+	return plan
+}
+
+func (p *AggFuncPushDown) optimize(plan *LogicalPlan, filterExpr Expr) {
+	switch {
+	case plan.TableScan != nil:
+		if filterExpr != nil {
+			plan.TableScan.Filter = filterExpr
+		}
+	case plan.Aggregation != nil:
+		if len(plan.Aggregation.GroupExprs) == 0 && len(plan.Aggregation.AggExprs) == 1 {
+			// TODO(asubiotto): Should we make this less specific?
+			filterExpr = plan.Aggregation.AggExprs[0]
+		}
+	default:
+		// If we find anything other than a table scan after a global
+		// aggregation, bail out by setting the filterExpr to nil.
+		filterExpr = nil
+	}
+
+	if plan.Input != nil {
+		p.optimize(plan.Input, filterExpr)
 	}
 }

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 
 	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/pqarrow/arrowutils"
@@ -24,7 +24,7 @@ import (
 type OrderedSynchronizer struct {
 	pool         memory.Allocator
 	orderByExprs []logicalplan.Expr
-	orderByCols  []int
+	orderByCols  []arrowutils.SortingColumn
 
 	sync struct {
 		mtx        sync.Mutex
@@ -50,6 +50,10 @@ func NewOrderedSynchronizer(pool memory.Allocator, inputs int, orderByExprs []lo
 	}
 	o.sync.inputsRunning = inputs
 	return o
+}
+
+func (o *OrderedSynchronizer) Close() {
+	o.next.Close()
 }
 
 func (o *OrderedSynchronizer) Callback(ctx context.Context, r arrow.Record) error {
@@ -113,7 +117,7 @@ func (o *OrderedSynchronizer) mergeRecordsLocked() (arrow.Record, error) {
 	if err := o.ensureSameSchema(o.sync.data); err != nil {
 		return nil, err
 	}
-	mergedRecord, err := arrowutils.MergeRecords(o.pool, o.sync.data, o.orderByCols)
+	mergedRecord, err := arrowutils.MergeRecords(o.pool, o.sync.data, o.orderByCols, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +157,8 @@ func (o *OrderedSynchronizer) ensureSameSchema(records []arrow.Record) error {
 	for i, orderCol := range o.orderByExprs {
 		orderCols[i] = make(map[string]arrow.Field)
 		for _, r := range records {
-			for _, field := range r.Schema().Fields() {
+			for j := 0; j < r.Schema().NumFields(); j++ {
+				field := r.Schema().Field(j)
 				if ok := orderCol.MatchColumn(field.Name); ok {
 					orderCols[i][field.Name] = field
 				} else {
@@ -192,7 +197,7 @@ func (o *OrderedSynchronizer) ensureSameSchema(records []arrow.Record) error {
 
 	o.orderByCols = o.orderByCols[:0]
 	for i := range newFields {
-		o.orderByCols = append(o.orderByCols, i)
+		o.orderByCols = append(o.orderByCols, arrowutils.SortingColumn{Index: i})
 	}
 
 	for _, field := range leftoverCols {
@@ -209,7 +214,8 @@ func (o *OrderedSynchronizer) ensureSameSchema(records []arrow.Record) error {
 		}
 
 		var columns []arrow.Array
-		for _, field := range schema.Fields() {
+		for j := 0; j < schema.NumFields(); j++ {
+			field := schema.Field(j)
 			if otherFields := otherSchema.FieldIndices(field.Name); otherFields != nil {
 				if len(otherFields) > 1 {
 					fieldsFound, _ := otherSchema.FieldsByName(field.Name)

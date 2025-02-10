@@ -5,15 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"text/tabwriter"
 
-	"github.com/segmentio/parquet-go"
-	"github.com/segmentio/parquet-go/compress"
-	"github.com/segmentio/parquet-go/encoding"
-	"github.com/segmentio/parquet-go/format"
+	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/compress"
+	"github.com/parquet-go/parquet-go/encoding"
+	"github.com/parquet-go/parquet-go/format"
 	"google.golang.org/protobuf/proto"
 
 	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
@@ -30,6 +32,7 @@ type ColumnDefinition struct {
 	Name          string
 	StorageLayout parquet.Node
 	Dynamic       bool
+	PreHash       bool
 }
 
 // SortingColumn describes a column to sort by in a dynamic parquet schema.
@@ -39,28 +42,34 @@ type SortingColumn interface {
 }
 
 // Ascending constructs a SortingColumn value which dictates to sort by the column in ascending order.
-func Ascending(column string) SortingColumn { return ascending(column) }
+func Ascending(column string) SortingColumn { return ascending{name: column, path: []string{column}} }
 
 // Descending constructs a SortingColumn value which dictates to sort by the column in descending order.
-func Descending(column string) SortingColumn { return descending(column) }
+func Descending(column string) SortingColumn { return descending{name: column, path: []string{column}} }
 
 // NullsFirst wraps the SortingColumn passed as argument so that it instructs
 // the row group to place null values first in the column.
 func NullsFirst(sortingColumn SortingColumn) SortingColumn { return nullsFirst{sortingColumn} }
 
-type ascending string
+type ascending struct {
+	name string
+	path []string
+}
 
-func (asc ascending) String() string     { return fmt.Sprintf("ascending(%s)", string(asc)) }
-func (asc ascending) ColumnName() string { return string(asc) }
-func (asc ascending) Path() []string     { return []string{string(asc)} }
+func (asc ascending) String() string     { return "ascending(" + asc.name + ")" }
+func (asc ascending) ColumnName() string { return asc.name }
+func (asc ascending) Path() []string     { return asc.path }
 func (asc ascending) Descending() bool   { return false }
 func (asc ascending) NullsFirst() bool   { return false }
 
-type descending string
+type descending struct {
+	name string
+	path []string
+}
 
-func (desc descending) String() string     { return fmt.Sprintf("descending(%s)", string(desc)) }
-func (desc descending) ColumnName() string { return string(desc) }
-func (desc descending) Path() []string     { return []string{string(desc)} }
+func (desc descending) String() string     { return "descending(" + desc.name + ")" }
+func (desc descending) ColumnName() string { return desc.name }
+func (desc descending) Path() []string     { return desc.path }
 func (desc descending) Descending() bool   { return true }
 func (desc descending) NullsFirst() bool   { return false }
 
@@ -70,10 +79,12 @@ func (nf nullsFirst) String() string   { return fmt.Sprintf("nulls_first+%s", nf
 func (nf nullsFirst) NullsFirst() bool { return true }
 
 func makeDynamicSortingColumn(dynamicColumnName string, sortingColumn SortingColumn) SortingColumn {
+	fullName := sortingColumn.ColumnName() + "." + dynamicColumnName
 	return dynamicSortingColumn{
 		SortingColumn:     sortingColumn,
 		dynamicColumnName: dynamicColumnName,
-		fullName:          sortingColumn.ColumnName() + "." + dynamicColumnName,
+		fullName:          fullName,
+		path:              []string{fullName},
 	}
 }
 
@@ -82,6 +93,7 @@ type dynamicSortingColumn struct {
 	SortingColumn
 	dynamicColumnName string
 	fullName          string
+	path              []string
 }
 
 func (dyn dynamicSortingColumn) String() string {
@@ -92,7 +104,7 @@ func (dyn dynamicSortingColumn) ColumnName() string {
 	return dyn.fullName
 }
 
-func (dyn dynamicSortingColumn) Path() []string { return []string{dyn.ColumnName()} }
+func (dyn dynamicSortingColumn) Path() []string { return dyn.path }
 
 // Schema is a dynamic parquet schema. It extends a parquet schema with the
 // ability that any column definition that is dynamic will have columns
@@ -104,13 +116,68 @@ type Schema struct {
 	sortingColumns []SortingColumn
 	dynamicColumns []int
 
-	writers *sync.Map
-	buffers *sync.Map
+	UniquePrimaryIndex bool
+
+	writers        *sync.Map
+	buffers        *sync.Map
+	sortingSchemas *sync.Map
+	parquetSchemas *sync.Map
 }
 
-// IsDynamicColumn returns true if the passed in column is a dynamic column.
-func (s *Schema) IsDynamicColumn(col string) bool {
-	return s.columns[s.columnIndexes[col]].Dynamic
+// FindDynamicColumnForConcreteColumn returns a column definition for the
+// column passed. So "labels.label1" would return the column definition for the
+// dynamic column "labels" if it exists.
+func (s *Schema) FindDynamicColumnForConcreteColumn(column string) (ColumnDefinition, bool) {
+	periodPosition := 0
+	foundPeriod := false
+	for i, c := range column {
+		if c != '.' {
+			continue
+		}
+		if foundPeriod {
+			// Can't have more than one period.
+			return ColumnDefinition{}, false
+		}
+		foundPeriod = true
+		periodPosition = i
+	}
+	if !foundPeriod {
+		return ColumnDefinition{}, false
+	}
+
+	return s.FindDynamicColumn(column[:periodPosition])
+}
+
+// FindDynamicColumn returns a dynamic column definition for the column passed.
+func (s *Schema) FindDynamicColumn(dynamicColumnName string) (ColumnDefinition, bool) {
+	idx, ok := s.columnIndexes[dynamicColumnName]
+	if !ok {
+		return ColumnDefinition{}, false
+	}
+
+	colDef := s.columns[idx]
+	// Note: This is different from the FindColumn function.
+	if !colDef.Dynamic {
+		return ColumnDefinition{}, false
+	}
+
+	return colDef, true
+}
+
+// FindColumn returns a column definition for the column passed.
+func (s *Schema) FindColumn(column string) (ColumnDefinition, bool) {
+	idx, ok := s.columnIndexes[column]
+	if !ok {
+		return ColumnDefinition{}, false
+	}
+
+	colDef := s.columns[idx]
+	// Note: This is different from the FindDynamicColumn function.
+	if colDef.Dynamic {
+		return ColumnDefinition{}, false
+	}
+
+	return colDef, true
 }
 
 func findLeavesFromNode(node *schemav2pb.Node) []ColumnDefinition {
@@ -190,8 +257,11 @@ func nameFromNodeDef(node *schemav2pb.Node) string {
 }
 
 func SchemaFromDefinition(msg proto.Message) (*Schema, error) {
-	var columns []ColumnDefinition
-	var sortingColumns []SortingColumn
+	var (
+		columns            []ColumnDefinition
+		sortingColumns     []SortingColumn
+		uniquePrimaryIndex bool
+	)
 	switch def := msg.(type) {
 	case *schemapb.Schema:
 		columns = make([]ColumnDefinition, 0, len(def.Columns))
@@ -204,6 +274,7 @@ func SchemaFromDefinition(msg proto.Message) (*Schema, error) {
 				Name:          col.Name,
 				StorageLayout: layout,
 				Dynamic:       col.Dynamic,
+				PreHash:       col.Prehash,
 			})
 		}
 
@@ -223,6 +294,7 @@ func SchemaFromDefinition(msg proto.Message) (*Schema, error) {
 			}
 			sortingColumns = append(sortingColumns, sortingColumn)
 		}
+		uniquePrimaryIndex = def.UniquePrimaryIndex
 	case *schemav2pb.Schema:
 		columns = []ColumnDefinition{}
 		for _, node := range def.Root.Nodes {
@@ -245,13 +317,10 @@ func SchemaFromDefinition(msg proto.Message) (*Schema, error) {
 			}
 			sortingColumns = append(sortingColumns, sortingColumn)
 		}
+		uniquePrimaryIndex = def.UniquePrimaryIndex
 	}
 
-	return newSchema(
-		msg,
-		columns,
-		sortingColumns,
-	), nil
+	return newSchema(msg, columns, sortingColumns, uniquePrimaryIndex), nil
 }
 
 // DefinitionFromParquetFile converts a parquet file into a schemapb.Schema.
@@ -401,7 +470,7 @@ type v1storageLayoutWrapper struct {
 }
 
 func (s *v1storageLayoutWrapper) GetRepeated() bool {
-	return false
+	return s.Repeated
 }
 
 func (s *v1storageLayoutWrapper) GetTypeInt32() int32 {
@@ -432,7 +501,7 @@ func (s *v2storageLayoutWrapper) GetCompressionInt32() int32 {
 	return int32(s.StorageLayout.GetCompression())
 }
 
-func StorageLayoutWrapper(layout *schemav2pb.StorageLayout) StorageLayout {
+func StorageLayoutWrapper(_ *schemav2pb.StorageLayout) StorageLayout {
 	return nil
 }
 
@@ -447,6 +516,10 @@ func storageLayoutToParquetNode(l StorageLayout) (parquet.Node, error) {
 		node = parquet.Leaf(parquet.DoubleType)
 	case int32(schemapb.StorageLayout_TYPE_BOOL):
 		node = parquet.Leaf(parquet.BooleanType)
+	case int32(schemapb.StorageLayout_TYPE_INT32):
+		node = parquet.Int(32)
+	case int32(schemapb.StorageLayout_TYPE_UINT64):
+		node = parquet.Uint(64)
 	default:
 		return nil, fmt.Errorf("unknown storage layout type: %v", l.GetTypeInt32())
 	}
@@ -518,6 +591,7 @@ func newSchema(
 	def proto.Message,
 	columns []ColumnDefinition,
 	sortingColumns []SortingColumn,
+	uniquePrimaryIndex bool,
 ) *Schema {
 	sort.Slice(columns, func(i, j int) bool {
 		return columns[i].Name < columns[j].Name
@@ -529,12 +603,15 @@ func newSchema(
 	}
 
 	s := &Schema{
-		def:            def,
-		columns:        columns,
-		sortingColumns: sortingColumns,
-		columnIndexes:  columnIndexes,
-		writers:        &sync.Map{},
-		buffers:        &sync.Map{},
+		def:                def,
+		columns:            columns,
+		sortingColumns:     sortingColumns,
+		columnIndexes:      columnIndexes,
+		writers:            &sync.Map{},
+		buffers:            &sync.Map{},
+		sortingSchemas:     &sync.Map{},
+		parquetSchemas:     &sync.Map{},
+		UniquePrimaryIndex: uniquePrimaryIndex,
 	}
 
 	for i, col := range columns {
@@ -573,7 +650,13 @@ func (s *Schema) Columns() []ColumnDefinition {
 	return s.columns
 }
 
-func (s *Schema) SortingColumns() []ColumnDefinition {
+func (s *Schema) SortingColumns() []SortingColumn {
+	sCols := make([]SortingColumn, len(s.sortingColumns))
+	copy(sCols, s.sortingColumns)
+	return sCols
+}
+
+func (s *Schema) ColumnDefinitionsForSortingColumns() []ColumnDefinition {
 	sCols := make([]ColumnDefinition, len(s.sortingColumns))
 	for i, col := range s.sortingColumns {
 		sCols[i] = s.columns[s.columnIndexes[col.ColumnName()]]
@@ -596,14 +679,9 @@ func (s *Schema) ParquetSchema() *parquet.Schema {
 	}
 }
 
-// DynamicParquetSchema returns the parquet schema for the dynamic schema with the
+// dynamicParquetSchema returns the parquet schema for the dynamic schema with the
 // concrete dynamic column names given in the argument.
-func (s Schema) DynamicParquetSchema(
-	dynamicColumns map[string][]string,
-) (
-	*parquet.Schema,
-	error,
-) {
+func (s Schema) dynamicParquetSchema(dynamicColumns map[string][]string) (*parquet.Schema, error) {
 	switch def := s.def.(type) {
 	case *schemav2pb.Schema:
 		return ParquetSchemaFromV2Definition(def), nil
@@ -614,10 +692,16 @@ func (s Schema) DynamicParquetSchema(
 				dyn := dynamicColumnsFor(col.Name, dynamicColumns)
 				for _, name := range dyn {
 					g[col.Name+"."+name] = col.StorageLayout
+					if col.PreHash {
+						g[HashedColumnName(col.Name+"."+name)] = parquet.Int(64) // TODO(thor): Do we need compression etc. here?
+					}
 				}
 				continue
 			}
 			g[col.Name] = col.StorageLayout
+			if col.PreHash {
+				g[HashedColumnName(col.Name)] = parquet.Int(64) // TODO(thor): Do we need compression etc. here?
+			}
 		}
 
 		return parquet.NewSchema(s.Name(), g), nil
@@ -688,6 +772,10 @@ type Buffer struct {
 
 func (b *Buffer) Reset() {
 	b.buffer.Reset()
+}
+
+func (b *Buffer) Size() int64 {
+	return b.buffer.Size()
 }
 
 func (b *Buffer) String() string {
@@ -931,24 +1019,36 @@ func (b *Buffer) DynamicRows() DynamicRowReader {
 	return newDynamicRowGroupReader(b, b.fields)
 }
 
+var (
+	matchFirstCap = regexp.MustCompile("(.)([A-Z][a-z]+)")
+	matchAllCap   = regexp.MustCompile("([a-z0-9])([A-Z])")
+)
+
+func ToSnakeCase(str string) string {
+	snake := matchFirstCap.ReplaceAllString(str, "${1}_${2}")
+	snake = matchAllCap.ReplaceAllString(snake, "${1}_${2}")
+	return strings.ToLower(snake)
+}
+
 // NewBuffer returns a new buffer with a concrete parquet schema generated
 // using the given concrete dynamic column names.
 func (s *Schema) NewBuffer(dynamicColumns map[string][]string) (*Buffer, error) {
-	ps, err := s.DynamicParquetSchema(dynamicColumns)
+	ps, err := s.GetDynamicParquetSchema(dynamicColumns)
 	if err != nil {
 		return nil, fmt.Errorf("create parquet schema for buffer: %w", err)
 	}
+	defer s.PutPooledParquetSchema(ps)
 
 	cols := s.ParquetSortingColumns(dynamicColumns)
 	return &Buffer{
 		dynamicColumns: dynamicColumns,
 		buffer: parquet.NewBuffer(
-			ps,
+			ps.Schema,
 			parquet.SortingRowGroupConfig(
 				parquet.SortingColumns(cols...),
 			),
 		),
-		fields: ps.Fields(),
+		fields: ps.Schema.Fields(),
 	}, nil
 }
 
@@ -986,7 +1086,7 @@ func (s *Schema) NewBufferV2(dynamicColumns ...*schemav2pb.Node) (*Buffer, error
 }
 
 func (s *Schema) SerializeBuffer(w io.Writer, buffer *Buffer) error {
-	pw, err := s.GetWriter(w, buffer.DynamicColumns())
+	pw, err := s.GetWriter(w, buffer.DynamicColumns(), false)
 	if err != nil {
 		return fmt.Errorf("create writer: %w", err)
 	}
@@ -1012,11 +1112,12 @@ const bloomFilterBitsPerValue = 10
 
 // NewWriter returns a new parquet writer with a concrete parquet schema
 // generated using the given concrete dynamic column names.
-func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*parquet.GenericWriter[any], error) {
-	ps, err := s.DynamicParquetSchema(dynamicColumns)
+func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string, sorting bool, options ...parquet.WriterOption) (ParquetWriter, error) {
+	ps, err := s.GetDynamicParquetSchema(dynamicColumns)
 	if err != nil {
 		return nil, err
 	}
+	defer s.PutPooledParquetSchema(ps)
 
 	cols := s.ParquetSortingColumns(dynamicColumns)
 	bloomFilterColumns := make([]parquet.BloomFilterColumn, 0, len(cols))
@@ -1036,8 +1137,8 @@ func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*pa
 		)
 	}
 
-	return parquet.NewGenericWriter[any](w,
-		ps,
+	writerOptions := []parquet.WriterOption{
+		ps.Schema,
 		parquet.ColumnIndexSizeLimit(ColumnIndexSize),
 		parquet.BloomFilters(bloomFilterColumns...),
 		parquet.KeyValueMetadata(
@@ -1047,38 +1148,98 @@ func (s *Schema) NewWriter(w io.Writer, dynamicColumns map[string][]string) (*pa
 		parquet.SortingWriterConfig(
 			parquet.SortingColumns(cols...),
 		),
-	), nil
+	}
+	writerOptions = append(writerOptions, options...)
+	if sorting {
+		return parquet.NewSortingWriter[any](w, 32*1024, writerOptions...), nil
+	}
+	return parquet.NewGenericWriter[any](w, writerOptions...), nil
+}
+
+type ParquetWriter interface {
+	Schema() *parquet.Schema
+	Write(rows []any) (int, error)
+	WriteRows(rows []parquet.Row) (int, error)
+	Flush() error
+	Close() error
+	Reset(writer io.Writer)
 }
 
 type PooledWriter struct {
 	pool *sync.Pool
-	*parquet.GenericWriter[any]
+	ParquetWriter
 }
 
-func (p PooledWriter) ParquetWriter() *parquet.GenericWriter[any] {
-	return p.GenericWriter
-}
-
-func (s *Schema) GetWriter(w io.Writer, dynamicColumns map[string][]string) (*PooledWriter, error) {
+func (s *Schema) GetWriter(w io.Writer, dynamicColumns map[string][]string, sorting bool) (*PooledWriter, error) {
 	key := serializeDynamicColumns(dynamicColumns)
-	pool, _ := s.writers.LoadOrStore(key, &sync.Pool{})
+	pool, _ := s.writers.LoadOrStore(fmt.Sprintf("%s,sorting=%t", key, sorting), &sync.Pool{})
 	pooled := pool.(*sync.Pool).Get()
 	if pooled == nil {
-		new, err := s.NewWriter(w, dynamicColumns)
+		pw, err := s.NewWriter(w, dynamicColumns, sorting)
 		if err != nil {
 			return nil, err
 		}
 		return &PooledWriter{
 			pool:          pool.(*sync.Pool),
-			GenericWriter: new,
+			ParquetWriter: pw,
 		}, nil
 	}
-	pooled.(*PooledWriter).GenericWriter.Reset(w)
+	pooled.(*PooledWriter).ParquetWriter.Reset(w)
 	return pooled.(*PooledWriter), nil
 }
 
+type PooledParquetSchema struct {
+	pool   *sync.Pool
+	Schema *parquet.Schema
+}
+
+// GetParquetSortingSchema returns a parquet schema of the sorting columns and
+// the given dynamic columns.
+// The difference with GetDynamicParquetSchema is that non-sorting columns are elided.
+func (s *Schema) GetParquetSortingSchema(dynamicColumns map[string][]string) (*PooledParquetSchema, error) {
+	key := serializeDynamicColumns(dynamicColumns)
+	pool, _ := s.sortingSchemas.LoadOrStore(key, &sync.Pool{})
+	pooled := pool.(*sync.Pool).Get()
+	if pooled == nil {
+		ps, err := s.parquetSortingSchema(dynamicColumns)
+		if err != nil {
+			return nil, err
+		}
+		return &PooledParquetSchema{
+			pool:   pool.(*sync.Pool),
+			Schema: ps,
+		}, nil
+	}
+	return pooled.(*PooledParquetSchema), nil
+}
+
+// GetDynamicParquetSchema returns a parquet schema of the all columns and
+// the given dynamic columns.
+// The difference with GetParquetSortingSchema is that all columns are included
+// in the parquet schema.
+func (s *Schema) GetDynamicParquetSchema(dynamicColumns map[string][]string) (*PooledParquetSchema, error) {
+	key := serializeDynamicColumns(dynamicColumns)
+	pool, _ := s.parquetSchemas.LoadOrStore(key, &sync.Pool{})
+	pooled := pool.(*sync.Pool).Get()
+	if pooled == nil {
+		ps, err := s.dynamicParquetSchema(dynamicColumns)
+		if err != nil {
+			return nil, err
+		}
+		return &PooledParquetSchema{
+			pool:   pool.(*sync.Pool),
+			Schema: ps,
+		}, nil
+	}
+	return pooled.(*PooledParquetSchema), nil
+}
+
+func (s *Schema) PutPooledParquetSchema(ps *PooledParquetSchema) {
+	ps.pool.Put(ps)
+}
+
 func (s *Schema) PutWriter(w *PooledWriter) {
-	w.GenericWriter.Reset(bytes.NewBuffer(nil))
+	w.ParquetWriter.Reset(bytes.NewBuffer(nil))
 	w.pool.Put(w)
 }
 
@@ -1096,13 +1257,13 @@ func (s *Schema) GetBuffer(dynamicColumns map[string][]string) (*PooledBuffer, e
 	pool, _ := s.buffers.LoadOrStore(key, &sync.Pool{})
 	pooled := pool.(*sync.Pool).Get()
 	if pooled == nil {
-		new, err := s.NewBuffer(dynamicColumns)
+		pw, err := s.NewBuffer(dynamicColumns)
 		if err != nil {
 			return nil, err
 		}
 		return &PooledBuffer{
 			pool:   pool.(*sync.Pool),
-			Buffer: new,
+			Buffer: pw,
 		}, nil
 	}
 	return pooled.(*PooledBuffer), nil
@@ -1145,6 +1306,10 @@ func (r *MergedRowGroup) DynamicRows() DynamicRowReader {
 
 type mergeOption struct {
 	dynamicColumns map[string][]string
+	// alreadySorted indicates that the row groups are already sorted and
+	// non-overlapping. This results in a parquet.MultiRowGroup, which is just
+	// a wrapper without the full-scale merging infrastructure.
+	alreadySorted bool
 }
 
 type MergeOption func(m *mergeOption)
@@ -1152,6 +1317,12 @@ type MergeOption func(m *mergeOption)
 func WithDynamicCols(cols map[string][]string) MergeOption {
 	return func(m *mergeOption) {
 		m.dynamicColumns = cols
+	}
+}
+
+func WithAlreadySorted() MergeOption {
+	return func(m *mergeOption) {
+		m.alreadySorted = true
 	}
 }
 
@@ -1174,28 +1345,33 @@ func (s *Schema) MergeDynamicRowGroups(rowGroups []DynamicRowGroup, options ...M
 	if dynamicColumns == nil {
 		dynamicColumns = mergeDynamicRowGroupDynamicColumns(rowGroups)
 	}
-	ps, err := s.DynamicParquetSchema(dynamicColumns)
+	ps, err := s.GetDynamicParquetSchema(dynamicColumns)
 	if err != nil {
 		return nil, fmt.Errorf("create merged parquet schema merging %d row groups: %w", len(rowGroups), err)
 	}
+	defer s.PutPooledParquetSchema(ps)
 
 	cols := s.ParquetSortingColumns(dynamicColumns)
 
 	adapters := make([]parquet.RowGroup, 0, len(rowGroups))
 	for _, rowGroup := range rowGroups {
 		adapters = append(adapters, NewDynamicRowGroupMergeAdapter(
-			ps,
+			ps.Schema,
 			cols,
 			dynamicColumns,
 			rowGroup,
 		))
 	}
 
+	var opts []parquet.RowGroupOption
+	if !m.alreadySorted {
+		opts = append(opts, parquet.SortingRowGroupConfig(
+			parquet.SortingColumns(cols...),
+		))
+	}
 	merge, err := parquet.MergeRowGroups(
 		adapters,
-		parquet.SortingRowGroupConfig(
-			parquet.SortingColumns(cols...),
-		),
+		opts...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create merge row groups: %w", err)
@@ -1204,7 +1380,7 @@ func (s *Schema) MergeDynamicRowGroups(rowGroups []DynamicRowGroup, options ...M
 	return &MergedRowGroup{
 		RowGroup: merge,
 		DynCols:  dynamicColumns,
-		fields:   ps.Fields(),
+		fields:   ps.Schema.Fields(),
 	}, nil
 }
 
@@ -1217,50 +1393,70 @@ func mergeDynamicRowGroupDynamicColumns(rowGroups []DynamicRowGroup) map[string]
 		sets = append(sets, batch.DynamicColumns())
 	}
 
-	return mergeDynamicColumnSets(sets)
+	return MergeDynamicColumnSets(sets)
 }
 
-func mergeDynamicColumnSets(sets []map[string][]string) map[string][]string {
-	dynamicColumns := map[string][][]string{}
-	for _, set := range sets {
-		for k, v := range set {
-			_, seen := dynamicColumns[k]
-			if !seen {
-				dynamicColumns[k] = [][]string{}
+func MergeDynamicColumnSets(sets []map[string][]string) map[string][]string {
+	m := newDynamicColumnSetMerger()
+	defer m.Release()
+	return m.Merge(sets)
+}
+
+type dynColSet struct {
+	keys   []string
+	seen   map[string]struct{}
+	values []string
+}
+
+func newDynamicColumnSetMerger() *dynColSet {
+	return mergeSetPool.Get().(*dynColSet)
+}
+
+var mergeSetPool = &sync.Pool{New: func() any {
+	return &dynColSet{
+		seen:   make(map[string]struct{}),
+		keys:   make([]string, 0, 16), // This is arbitrary we anticipate to be lower than values size
+		values: make([]string, 0, 64), // This is arbitrary
+	}
+}}
+
+func (c *dynColSet) Release() {
+	c.keys = c.keys[:0]
+	clear(c.seen)
+	c.values = c.values[:0]
+	mergeSetPool.Put(c)
+}
+
+func (c *dynColSet) Merge(sets []map[string][]string) (o map[string][]string) {
+	// TODO:(gernest) use k-way merge
+	o = make(map[string][]string)
+	for i := range sets {
+		for k := range sets[i] {
+			if _, ok := c.seen[k]; !ok {
+				c.keys = append(c.keys, k)
+				c.seen[k] = struct{}{}
 			}
-			dynamicColumns[k] = append(dynamicColumns[k], v)
 		}
 	}
-
-	resultDynamicColumns := map[string][]string{}
-	for name, dynCols := range dynamicColumns {
-		resultDynamicColumns[name] = mergeDynamicColumns(dynCols)
-	}
-
-	return resultDynamicColumns
-}
-
-// mergeDynamicColumns merges the given concrete dynamic column names into a
-// single superset. It assumes that the given DynamicColumns are all for the
-// same dynamic column name.
-func mergeDynamicColumns(dyn [][]string) []string {
-	return mergeStrings(dyn)
-}
-
-// mergeStrings merges the given sorted string slices into a single sorted and
-// deduplicated slice of strings.
-func mergeStrings(str [][]string) []string {
-	result := []string{}
-	seen := map[string]struct{}{}
-	for _, s := range str {
-		for _, n := range s {
-			if _, ok := seen[n]; !ok {
-				result = append(result, n)
-				seen[n] = struct{}{}
+	for i := range c.keys {
+		clear(c.seen)
+		for j := range sets {
+			ls, ok := sets[j][c.keys[i]]
+			if !ok {
+				continue
+			}
+			for k := range ls {
+				if _, ok := c.seen[ls[k]]; !ok {
+					c.values = append(c.values, ls[k])
+					c.seen[ls[k]] = struct{}{}
+				}
 			}
 		}
+		sort.Strings(c.values)
+		o[c.keys[i]] = slices.Clone(c.values)
+		c.values = c.values[:0]
 	}
-	return MergeDeduplicatedDynCols(result)
+	return
 }
 
 // MergeDeduplicatedDynCols is a light wrapper over sorting the deduplicated
@@ -1448,6 +1644,12 @@ type remappedPage struct {
 	remappedIndex int
 }
 
+type releasable interface {
+	Release()
+}
+
+var _ releasable = (*remappedPage)(nil)
+
 // Column returns the page's column index in the schema. It returns the
 // configured remapped index. Implements the parquet.Page interface.
 func (p *remappedPage) Column() int {
@@ -1462,6 +1664,10 @@ func (p *remappedPage) Values() parquet.ValueReader {
 		ValueReader:   p.Page.Values(),
 		remappedIndex: p.remappedIndex,
 	}
+}
+
+func (p *remappedPage) Release() {
+	parquet.Release(p.Page)
 }
 
 // Values returns the page's values. It ensures that all values read will be

@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 
 	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
@@ -101,7 +101,7 @@ func TestLess(t *testing.T) {
 	rowGroups := []DynamicRowGroup{}
 	for _, sample := range samples {
 		s := Samples{sample}
-		rg, err := s.ToBuffer(schema)
+		rg, err := ToBuffer(s, schema)
 		require.NoError(t, err)
 		rowGroups = append(rowGroups, rg)
 	}
@@ -161,7 +161,7 @@ func TestLess(t *testing.T) {
 		modifiedSample := samples[0]
 		modifiedSample.Timestamp++
 
-		rg, err := (Samples{modifiedSample}).ToBuffer(schema)
+		rg, err := ToBuffer(Samples{modifiedSample}, schema)
 		require.NoError(t, err)
 		row4 := &DynamicRows{
 			Schema:         rg.Schema(),
@@ -187,10 +187,7 @@ func TestLess(t *testing.T) {
 		schema := NewSampleSchema()
 		sample := Sample{
 			ExampleType: "cpu",
-			Labels: []Label{{
-				Name:  "node",
-				Value: "test3",
-			}},
+			Labels:      map[string]string{"node": "test3"},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
@@ -198,7 +195,7 @@ func TestLess(t *testing.T) {
 			Timestamp: 2,
 			Value:     5,
 		}
-		rg, err := Samples{sample}.ToBuffer(schema)
+		rg, err := ToBuffer(Samples{sample}, schema)
 		require.NoError(t, err)
 		row1 := &DynamicRows{
 			Schema:         rg.Schema(),
@@ -212,7 +209,7 @@ func TestLess(t *testing.T) {
 
 		// Add 1 to the last stacktrace byte.
 		sample.Stacktrace[1][15] = 0x3
-		rg, err = Samples{sample}.ToBuffer(schema)
+		rg, err = ToBuffer(Samples{sample}, schema)
 		require.NoError(t, err)
 		row2 := &DynamicRows{
 			Schema:         rg.Schema(),
@@ -231,8 +228,8 @@ func TestLess(t *testing.T) {
 func TestLessWithDynamicSchemas(t *testing.T) {
 	schema := NewSampleSchema()
 	samples := Samples{{
-		Labels: []Label{
-			{Name: "label12", Value: "value12"},
+		Labels: map[string]string{
+			"label12": "value12",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -241,8 +238,8 @@ func TestLessWithDynamicSchemas(t *testing.T) {
 		Timestamp: 2,
 		Value:     2,
 	}, {
-		Labels: []Label{
-			{Name: "label14", Value: "value14"},
+		Labels: map[string]string{
+			"label14": "value14",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -255,7 +252,7 @@ func TestLessWithDynamicSchemas(t *testing.T) {
 	rowGroups := []DynamicRowGroup{}
 	for _, sample := range samples {
 		s := Samples{sample}
-		rg, err := s.ToBuffer(schema)
+		rg, err := ToBuffer(s, schema)
 		require.NoError(t, err)
 		rowGroups = append(rowGroups, rg)
 	}

@@ -6,14 +6,59 @@ import (
 	"math/rand"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
 
-	"github.com/polarsignals/frostdb/pqarrow/arrowutils"
 	"github.com/polarsignals/frostdb/pqarrow/builder"
 )
+
+func TestOptBuilders(t *testing.T) {
+	testCases := []struct {
+		b builder.OptimizedBuilder
+		v any
+	}{
+		{
+			b: builder.NewOptBinaryBuilder(arrow.BinaryTypes.Binary),
+			v: []byte("hello"),
+		},
+		{
+			b: builder.NewOptBooleanBuilder(arrow.FixedWidthTypes.Boolean),
+			v: true,
+		},
+		{
+			b: builder.NewOptFloat64Builder(arrow.PrimitiveTypes.Float64),
+			v: 1.0,
+		},
+		{
+			b: builder.NewOptInt32Builder(arrow.PrimitiveTypes.Int32),
+			v: int32(123),
+		},
+		{
+			b: builder.NewOptInt64Builder(arrow.PrimitiveTypes.Int64),
+			v: int64(123),
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%T", tc.b), func(t *testing.T) {
+			require.NoError(t, builder.AppendGoValue(tc.b, tc.v))
+			require.NoError(t, builder.AppendGoValue(tc.b, tc.v))
+
+			require.Equal(t, tc.b.Len(), 2)
+			require.True(t, tc.b.IsValid(0))
+			require.True(t, tc.b.IsValid(1))
+
+			tc.b.SetNull(1) // overwrite second value with NULL
+			require.True(t, tc.b.IsValid(0))
+			require.True(t, tc.b.IsNull(1))
+
+			a := tc.b.NewArray()
+			require.Equal(t, tc.v, a.GetOneForMarshal(0))
+			require.Equal(t, nil, a.GetOneForMarshal(1))
+		})
+	}
+}
 
 // https://github.com/polarsignals/frostdb/issues/270
 func TestIssue270(t *testing.T) {
@@ -54,8 +99,7 @@ func TestRepeatLastValue(t *testing.T) {
 		require.Equal(t, tc.b.Len(), 10)
 		a := tc.b.NewArray()
 		for i := 0; i < a.Len(); i++ {
-			v, err := arrowutils.GetValue(a, i)
-			require.NoError(t, err)
+			v := a.GetOneForMarshal(i)
 			require.Equal(t, tc.v, v)
 		}
 	}
@@ -112,4 +156,16 @@ func Test_BuildLargeArray(t *testing.T) {
 
 	// We expect fewer rows in the array
 	require.Equal(t, n-1, newarr.Data().Len())
+}
+
+func TestOptBinaryBuilder_Value(t *testing.T) {
+	b := builder.NewOptBinaryBuilder(arrow.BinaryTypes.Binary)
+	values := []string{"1", "2", "3"}
+	for _, v := range values {
+		require.NoError(t, b.Append([]byte(v)))
+	}
+
+	for i, value := range values {
+		require.Equal(t, value, string(b.Value(i)))
+	}
 }

@@ -5,21 +5,22 @@ import (
 
 	"github.com/polarsignals/frostdb/dynparquet"
 
-	"github.com/apache/arrow/go/v10/arrow/scalar"
+	"github.com/apache/arrow/go/v17/arrow/scalar"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOptimizePhysicalProjectionPushDown(t *testing.T) {
 	tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
-	p, _ := (&Builder{}).
+	p, err := (&Builder{}).
 		Scan(tableProvider, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
-		Project(Col("stacktrace")).
+		Project(Col("stacktrace"), Sum(Col("value")).Alias("value_sum")).
 		Build()
+	require.NoError(t, err)
 
 	optimizer := &PhysicalProjectionPushDown{}
 	optimizer.Optimize(p)
@@ -33,8 +34,8 @@ func TestOptimizePhysicalProjectionPushDown(t *testing.T) {
 		// use a more efficient datastructure in the future.
 		PhysicalProjection: []Expr{
 			&Column{ColumnName: "stacktrace"},
-			&Column{ColumnName: "stacktrace"},
 			&Column{ColumnName: "value"},
+			DynCol(hashedMatch),
 			&Column{ColumnName: "labels.test"},
 		},
 	},
@@ -44,36 +45,35 @@ func TestOptimizePhysicalProjectionPushDown(t *testing.T) {
 }
 
 func TestOptimizeDistinctPushDown(t *testing.T) {
-	p, _ := (&Builder{}).
-		Scan(nil, "table1").
+	tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
+	p, err := (&Builder{}).
+		Scan(tableProvider, "table1").
 		Distinct(Col("labels.test")).
 		Build()
+	require.NoError(t, err)
 
 	optimizer := &DistinctPushDown{}
 	p = optimizer.Optimize(p)
 
-	require.Equal(t, &TableScan{
-		TableName: "table1",
-		Distinct: []Expr{
-			&Column{ColumnName: "labels.test"},
-		},
-	},
+	require.Equal(t,
+		[]Expr{&Column{ColumnName: "labels.test"}},
 		// Distinct -> TableScan
-		p.Input.TableScan,
+		p.Input.Input.TableScan.Distinct,
 	)
 }
 
 func TestOptimizeFilterPushDown(t *testing.T) {
 	tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
-	p, _ := (&Builder{}).
+	p, err := (&Builder{}).
 		Scan(tableProvider, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
-		Project(Col("stacktrace")).
+		Project(Col("stacktrace"), Sum(Col("value")).Alias("value_sum")).
 		Build()
+	require.NoError(t, err)
 
 	optimizer := &FilterPushDown{}
 	optimizer.Optimize(p)
@@ -95,99 +95,75 @@ func TestOptimizeFilterPushDown(t *testing.T) {
 	)
 }
 
-func TestRemoveProjectionAtRoot(t *testing.T) {
-	p, _ := (&Builder{}).
-		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
-		Filter(Col("labels.test").Eq(Literal("abc"))).
-		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
-			[]Expr{Col("stacktrace")},
-		).
-		Project(Col("stacktrace")).
-		Build()
-
-	p = removeProjection(p)
-
-	require.True(t, p.Projection == nil)
-}
-
-func TestRemoveMiddleProjection(t *testing.T) {
-	p, _ := (&Builder{}).
-		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
-		Filter(Col("labels.test").Eq(Literal("abc"))).
-		Project(Col("stacktrace")).
-		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
-			[]Expr{Col("stacktrace")},
-		).
-		Build()
-
-	p = removeProjection(p)
-
-	require.True(t, p.Input.Projection == nil)
-}
-
-func TestRemoveLowestProjection(t *testing.T) {
-	p, _ := (&Builder{}).
-		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
-		Project(Col("stacktrace")).
-		Filter(Col("labels.test").Eq(Literal("abc"))).
-		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
-			[]Expr{Col("stacktrace")},
-		).
-		Build()
-
-	p = removeProjection(p)
-
-	require.True(t, p.Input.Input.Projection == nil)
-}
-
 func TestProjectionPushDown(t *testing.T) {
-	p, _ := (&Builder{}).
+	p, err := (&Builder{}).
 		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
-		Project(Col("labels")).
 		Build()
+	require.NoError(t, err)
 
-	p = (&ProjectionPushDown{}).Optimize(p)
+	p = (&PhysicalProjectionPushDown{}).Optimize(p)
 
-	require.True(t, p.Input.Input.Projection == nil)
+	require.Equal(t, []Expr{
+		Col("stacktrace"),
+		Col("value"),
+		DynCol("hashed"),
+		Col("labels.test"),
+	}, p.Input.Input.TableScan.PhysicalProjection)
+}
+
+func TestProjectionPushDownReset(t *testing.T) {
+	p, err := (&Builder{}).
+		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
+		Filter(Col("labels.test").Eq(Literal("abc"))).
+		Aggregate(
+			[]*AggregationFunction{Sum(Col("value"))},
+			[]Expr{Col("stacktrace")},
+		).
+		Project(Col("test")).
+		Build()
+	require.NoError(t, err)
+
+	p = (&PhysicalProjectionPushDown{}).Optimize(p)
+
+	require.Equal(t, []Expr{
+		Col("stacktrace"),
+		Col("value"),
+		DynCol("hashed"),
+		Col("labels.test"),
+	}, p.Input.Input.Input.TableScan.PhysicalProjection)
 }
 
 func TestProjectionPushDownOfDistinct(t *testing.T) {
-	p, _ := (&Builder{}).
+	p, err := (&Builder{}).
 		Scan(&mockTableProvider{schema: dynparquet.NewSampleSchema()}, "table1").
 		Distinct(DynCol("labels")).
 		Build()
+	require.NoError(t, err)
 
-	p = (&ProjectionPushDown{}).Optimize(p)
+	p = (&PhysicalProjectionPushDown{}).Optimize(p)
 
-	require.True(t, p.Input.Projection != nil)
+	require.Equal(t, []Expr{DynCol("labels")}, p.Input.Input.TableScan.PhysicalProjection)
 }
 
 func TestAllOptimizers(t *testing.T) {
 	tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
-	p, _ := (&Builder{}).
+	p, err := (&Builder{}).
 		Scan(tableProvider, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
 		Project(Col("stacktrace")).
 		Build()
+	require.NoError(t, err)
 
-	optimizers := []Optimizer{
-		&PhysicalProjectionPushDown{},
-		&FilterPushDown{},
-		&DistinctPushDown{},
-		&ProjectionPushDown{},
-	}
+	optimizers := DefaultOptimizers()
 
 	for _, optimizer := range optimizers {
 		p = optimizer.Optimize(p)
@@ -202,8 +178,8 @@ func TestAllOptimizers(t *testing.T) {
 		// use a more efficient datastructure in the future.
 		PhysicalProjection: []Expr{
 			&Column{ColumnName: "stacktrace"},
-			&Column{ColumnName: "stacktrace"},
 			&Column{ColumnName: "value"},
+			DynCol(hashedMatch),
 			&Column{ColumnName: "labels.test"},
 		},
 		Filter: &BinaryExpr{
@@ -217,4 +193,78 @@ func TestAllOptimizers(t *testing.T) {
 		// Aggregate -> Filter -> Projection -> TableScan
 		p.Input.Input.Input.TableScan,
 	)
+}
+
+func TestAggFuncPushDown(t *testing.T) {
+	t.Run("GlobalAgg", func(t *testing.T) {
+		tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
+		p, err := (&Builder{}).
+			Scan(tableProvider, "table1").
+			Aggregate(
+				[]*AggregationFunction{Max(Col("value"))},
+				nil,
+			).
+			Build()
+		require.NoError(t, err)
+
+		p = (&AggFuncPushDown{}).Optimize(p)
+		// Aggregation should still happen.
+		require.NotNil(t, p.Aggregation)
+		require.Equal(t,
+			&TableScan{
+				TableName:     "table1",
+				TableProvider: tableProvider,
+				Filter: &AggregationFunction{
+					Func: AggFuncMax,
+					Expr: &Column{ColumnName: "value"},
+				},
+			},
+			p.Input.TableScan,
+		)
+	})
+	t.Run("DontPushWithGroupExprs", func(t *testing.T) {
+		tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
+		p, err := (&Builder{}).
+			Scan(tableProvider, "table1").
+			Aggregate(
+				[]*AggregationFunction{Max(Col("value"))},
+				[]Expr{Col("stacktrace")},
+			).
+			Build()
+		require.NoError(t, err)
+
+		p = (&AggFuncPushDown{}).Optimize(p)
+		// Aggregation should still happen.
+		require.NotNil(t, p.Aggregation)
+		require.Equal(t,
+			&TableScan{
+				TableName:     "table1",
+				TableProvider: tableProvider,
+			},
+			p.Input.TableScan,
+		)
+	})
+	t.Run("DontPushWithFilter", func(t *testing.T) {
+		tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
+		p, err := (&Builder{}).
+			Scan(tableProvider, "table1").
+			Filter(Col("labels.test").Eq(Literal("abc"))).
+			Aggregate(
+				[]*AggregationFunction{Max(Col("value"))},
+				nil,
+			).
+			Build()
+		require.NoError(t, err)
+
+		p = (&AggFuncPushDown{}).Optimize(p)
+		// Aggregation should still happen.
+		require.NotNil(t, p.Aggregation)
+		require.Equal(t,
+			&TableScan{
+				TableName:     "table1",
+				TableProvider: tableProvider,
+			},
+			p.Input.Input.TableScan,
+		)
+	})
 }

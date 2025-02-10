@@ -3,15 +3,15 @@ package builder
 import (
 	"fmt"
 	"math"
-	"reflect"
+	"slices"
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/bitutil"
-	"github.com/apache/arrow/go/v10/arrow/memory"
-	"github.com/segmentio/parquet-go"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/bitutil"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/parquet-go/parquet-go"
 )
 
 // ColumnBuilder is a subset of the array.Builder interface implemented by the
@@ -31,6 +31,9 @@ type OptimizedBuilder interface {
 	AppendNulls(int)
 	ResetToLength(int)
 	RepeatLastValue(int) error
+	IsNull(i int) bool
+	IsValid(i int) bool
+	SetNull(i int)
 }
 
 type builderBase struct {
@@ -74,11 +77,24 @@ func (b *builderBase) AppendNulls(n int) {
 	b.length += n
 }
 
+// SetNull is setting the value at the index i to null.
+func (b *builderBase) SetNull(i int) {
+	bitutil.ClearBit(b.validityBitmap, i)
+}
+
+func (b *builderBase) IsValid(n int) bool {
+	return bitutil.BitIsSet(b.validityBitmap, n)
+}
+
 // appendValid does the opposite of appendNulls.
 func (b *builderBase) appendValid(n int) {
 	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length+n)
 	bitutil.SetBitsTo(b.validityBitmap, int64(b.length), int64(n), true)
 	b.length += n
+}
+
+func (b *builderBase) IsNull(n int) bool {
+	return bitutil.BitIsNotSet(b.validityBitmap, n)
 }
 
 func resizeBitmap(bitmap []byte, valuesToRepresent int) []byte {
@@ -95,6 +111,7 @@ var (
 	_ OptimizedBuilder = (*OptBinaryBuilder)(nil)
 	_ OptimizedBuilder = (*OptInt64Builder)(nil)
 	_ OptimizedBuilder = (*OptBooleanBuilder)(nil)
+	_ OptimizedBuilder = (*OptFloat64Builder)(nil)
 )
 
 // OptBinaryBuilder is an optimized array.BinaryBuilder.
@@ -148,14 +165,7 @@ func (b *OptBinaryBuilder) AppendNulls(n int) {
 // a new array.
 func (b *OptBinaryBuilder) NewArray() arrow.Array {
 	b.offsets = append(b.offsets, uint32(len(b.data)))
-	var offsetsAsBytes []byte
-
-	fromHeader := (*reflect.SliceHeader)(unsafe.Pointer(&b.offsets))
-	toHeader := (*reflect.SliceHeader)(unsafe.Pointer(&offsetsAsBytes))
-	toHeader.Data = fromHeader.Data
-	toHeader.Len = fromHeader.Len * arrow.Uint32SizeBytes
-	toHeader.Cap = fromHeader.Cap * arrow.Uint32SizeBytes
-
+	offsetsAsBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(b.offsets))), len(b.offsets)*arrow.Uint32SizeBytes)
 	data := array.NewData(
 		b.dtype,
 		b.length,
@@ -170,7 +180,7 @@ func (b *OptBinaryBuilder) NewArray() arrow.Array {
 	)
 	b.reset()
 	b.offsets = b.offsets[:0]
-	b.data = b.data[:0]
+	b.data = nil
 
 	return array.NewBinaryData(data)
 }
@@ -273,6 +283,13 @@ func (b *OptBinaryBuilder) ResetToLength(n int) {
 	b.validityBitmap = resizeBitmap(b.validityBitmap, n)
 }
 
+func (b *OptBinaryBuilder) Value(i int) []byte {
+	if i == b.length-1 { // last value
+		return b.data[b.offsets[i]:]
+	}
+	return b.data[b.offsets[i]:b.offsets[i+1]]
+}
+
 type OptInt64Builder struct {
 	builderBase
 
@@ -311,14 +328,7 @@ func (b *OptInt64Builder) AppendNulls(n int) {
 }
 
 func (b *OptInt64Builder) NewArray() arrow.Array {
-	var dataAsBytes []byte
-
-	fromHeader := (*reflect.SliceHeader)(unsafe.Pointer(&b.data))
-	toHeader := (*reflect.SliceHeader)(unsafe.Pointer(&dataAsBytes))
-	toHeader.Data = fromHeader.Data
-	toHeader.Len = fromHeader.Len * arrow.Int64SizeBytes
-	toHeader.Cap = fromHeader.Cap * arrow.Int64SizeBytes
-
+	dataAsBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(b.data))), len(b.data)*arrow.Int64SizeBytes)
 	data := array.NewData(
 		b.dtype,
 		b.length,
@@ -331,7 +341,7 @@ func (b *OptInt64Builder) NewArray() arrow.Array {
 		0,
 	)
 	b.reset()
-	b.data = b.data[:0]
+	b.data = nil
 	return array.NewInt64Data(data)
 }
 
@@ -350,6 +360,19 @@ func (b *OptInt64Builder) Append(v int64) {
 	b.length++
 	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length)
 	bitutil.SetBit(b.validityBitmap, b.length-1)
+}
+
+func (b *OptInt64Builder) Set(i int, v int64) {
+	b.data[i] = v
+}
+
+func (b *OptInt64Builder) Add(i int, v int64) {
+	b.data[i] += v
+}
+
+// Value returns the ith value of the builder.
+func (b *OptInt64Builder) Value(i int) int64 {
+	return b.data[i]
 }
 
 func (b *OptInt64Builder) AppendParquetValues(values []parquet.Value) {
@@ -437,7 +460,7 @@ func (b *OptBooleanBuilder) NewArray() arrow.Array {
 		0,
 	)
 	b.reset()
-	b.data = b.data[:0]
+	b.data = nil
 	array := array.NewBooleanData(data)
 	return array
 }
@@ -455,7 +478,15 @@ func (b *OptBooleanBuilder) Append(data []byte, valid int) {
 	}
 }
 
-func (b *OptBooleanBuilder) AppendData(data []byte) {
+func (b *OptBooleanBuilder) Set(i int, v bool) {
+	bitutil.SetBitTo(b.data, i, v)
+}
+
+func (b *OptBooleanBuilder) Value(i int) bool {
+	return bitutil.BitIsSet(b.data, i)
+}
+
+func (b *OptBooleanBuilder) AppendData(_ []byte) {
 	panic("do not use AppendData for opt boolean builder, use Append instead")
 }
 
@@ -500,5 +531,264 @@ func (b *OptBooleanBuilder) ResetToLength(n int) {
 
 	b.length = n
 	b.data = resizeBitmap(b.data, n)
+	b.validityBitmap = resizeBitmap(b.validityBitmap, n)
+}
+
+type OptInt32Builder struct {
+	builderBase
+
+	data []int32
+}
+
+func NewOptInt32Builder(dtype arrow.DataType) *OptInt32Builder {
+	b := &OptInt32Builder{}
+	b.dtype = dtype
+	return b
+}
+
+func (b *OptInt32Builder) resizeData(neededLength int) {
+	if cap(b.data) < neededLength {
+		oldData := b.data
+		b.data = make([]int32, bitutil.NextPowerOf2(neededLength))
+		copy(b.data, oldData)
+	}
+	b.data = b.data[:neededLength]
+}
+
+func (b *OptInt32Builder) Release() {
+	if atomic.AddInt64(&b.refCount, -1) == 0 {
+		b.data = nil
+		b.releaseInternal()
+	}
+}
+
+func (b *OptInt32Builder) AppendNull() {
+	b.AppendNulls(1)
+}
+
+func (b *OptInt32Builder) AppendNulls(n int) {
+	b.resizeData(b.length + n)
+	b.builderBase.AppendNulls(n)
+}
+
+func (b *OptInt32Builder) NewArray() arrow.Array {
+	dataAsBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(b.data))), len(b.data)*arrow.Int32SizeBytes)
+	data := array.NewData(
+		b.dtype,
+		b.length,
+		[]*memory.Buffer{
+			memory.NewBufferBytes(b.validityBitmap),
+			memory.NewBufferBytes(dataAsBytes),
+		},
+		nil,
+		b.length-bitutil.CountSetBits(b.validityBitmap, 0, b.length),
+		0,
+	)
+	b.reset()
+	b.data = nil
+	return array.NewInt32Data(data)
+}
+
+// AppendData appends a slice of int32s to the builder. This data is considered
+// to be non-null.
+func (b *OptInt32Builder) AppendData(data []int32) {
+	oldLength := b.length
+	b.data = append(b.data, data...)
+	b.length += len(data)
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length)
+	bitutil.SetBitsTo(b.validityBitmap, int64(oldLength), int64(len(data)), true)
+}
+
+func (b *OptInt32Builder) Append(v int32) {
+	b.data = append(b.data, v)
+	b.length++
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length)
+	bitutil.SetBit(b.validityBitmap, b.length-1)
+}
+
+// Set sets value v at index i. THis will panic if i is out of bounds. Use this
+// after calling Reserve.
+func (b *OptInt32Builder) Set(i int, v int32) {
+	b.data[i] = v
+	bitutil.SetBit(b.validityBitmap, i)
+}
+
+// Swap swaps values at i and j index.
+func (b *OptInt32Builder) Swap(i, j int) {
+	b.data[i], b.data[j] = b.data[j], b.data[i]
+}
+
+func (b *OptInt32Builder) Add(i int, v int32) {
+	b.data[i] += v
+}
+
+func (b *OptInt32Builder) Value(i int) int32 {
+	return b.data[i]
+}
+
+func (b *OptInt32Builder) AppendParquetValues(values []parquet.Value) {
+	b.resizeData(b.length + len(values))
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length+len(values))
+	for i, j := b.length, 0; i < b.length+len(values) && j < len(values); {
+		b.data[i] = values[j].Int32()
+		bitutil.SetBitTo(b.validityBitmap, i, !values[j].IsNull())
+		i++
+		j++
+	}
+	b.length += len(values)
+}
+
+func (b *OptInt32Builder) RepeatLastValue(n int) error {
+	if bitutil.BitIsNotSet(b.validityBitmap, b.length-1) {
+		b.AppendNulls(n)
+		return nil
+	}
+
+	lastValue := b.data[b.length-1]
+	b.resizeData(b.length + n)
+	for i := b.length; i < b.length+n; i++ {
+		b.data[i] = lastValue
+	}
+	b.appendValid(n)
+	return nil
+}
+
+// ResetToLength is specific to distinct optimizations in FrostDB.
+func (b *OptInt32Builder) ResetToLength(n int) {
+	if n == b.length {
+		return
+	}
+
+	b.length = n
+	b.data = b.data[:n]
+	b.validityBitmap = resizeBitmap(b.validityBitmap, n)
+}
+
+func (b *OptInt32Builder) Reserve(n int) {
+	b.length = n
+	b.data = slices.Grow(b.data, n)[:n]
+	b.validityBitmap = resizeBitmap(b.validityBitmap, n)
+}
+
+type OptFloat64Builder struct {
+	builderBase
+
+	data []float64
+}
+
+func NewOptFloat64Builder(dtype arrow.DataType) *OptFloat64Builder {
+	b := &OptFloat64Builder{}
+	b.dtype = dtype
+	return b
+}
+
+func (b *OptFloat64Builder) resizeData(neededLength int) {
+	if cap(b.data) < neededLength {
+		oldData := b.data
+		b.data = make([]float64, bitutil.NextPowerOf2(neededLength))
+		copy(b.data, oldData)
+	}
+	b.data = b.data[:neededLength]
+}
+
+func (b *OptFloat64Builder) Release() {
+	if atomic.AddInt64(&b.refCount, -1) == 0 {
+		b.data = nil
+		b.releaseInternal()
+	}
+}
+
+func (b *OptFloat64Builder) AppendNull() {
+	b.AppendNulls(1)
+}
+
+func (b *OptFloat64Builder) AppendNulls(n int) {
+	b.resizeData(b.length + n)
+	b.builderBase.AppendNulls(n)
+}
+
+func (b *OptFloat64Builder) NewArray() arrow.Array {
+	dataAsBytes := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(b.data))), len(b.data)*arrow.Float64SizeBytes)
+	data := array.NewData(
+		b.dtype,
+		b.length,
+		[]*memory.Buffer{
+			memory.NewBufferBytes(b.validityBitmap),
+			memory.NewBufferBytes(dataAsBytes),
+		},
+		nil,
+		b.length-bitutil.CountSetBits(b.validityBitmap, 0, b.length),
+		0,
+	)
+	b.reset()
+	b.data = nil
+	return array.NewFloat64Data(data)
+}
+
+// AppendData appends a slice of float64s to the builder.
+// This data is considered to be non-null.
+func (b *OptFloat64Builder) AppendData(data []float64) {
+	oldLength := b.length
+	b.data = append(b.data, data...)
+	b.length += len(data)
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length)
+	bitutil.SetBitsTo(b.validityBitmap, int64(oldLength), int64(len(data)), true)
+}
+
+func (b *OptFloat64Builder) Append(v float64) {
+	b.data = append(b.data, v)
+	b.length++
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length)
+	bitutil.SetBit(b.validityBitmap, b.length-1)
+}
+
+func (b *OptFloat64Builder) Set(i int, v float64) {
+	b.data[i] = v
+}
+
+func (b *OptFloat64Builder) Add(i int, v float64) {
+	b.data[i] += v
+}
+
+// Value returns the ith value of the builder.
+func (b *OptFloat64Builder) Value(i int) float64 {
+	return b.data[i]
+}
+
+func (b *OptFloat64Builder) AppendParquetValues(values []parquet.Value) {
+	b.resizeData(b.length + len(values))
+	b.validityBitmap = resizeBitmap(b.validityBitmap, b.length+len(values))
+	for i, j := b.length, 0; i < b.length+len(values) && j < len(values); {
+		b.data[i] = values[j].Double()
+		bitutil.SetBitTo(b.validityBitmap, i, !values[j].IsNull())
+		i++
+		j++
+	}
+	b.length += len(values)
+}
+
+func (b *OptFloat64Builder) RepeatLastValue(n int) error {
+	if bitutil.BitIsNotSet(b.validityBitmap, b.length-1) {
+		b.AppendNulls(n)
+		return nil
+	}
+
+	lastValue := b.data[b.length-1]
+	b.resizeData(b.length + n)
+	for i := b.length; i < b.length+n; i++ {
+		b.data[i] = lastValue
+	}
+	b.appendValid(n)
+	return nil
+}
+
+// ResetToLength is specific to distinct optimizations in FrostDB.
+func (b *OptFloat64Builder) ResetToLength(n int) {
+	if n == b.length {
+		return
+	}
+
+	b.length = n
+	b.data = b.data[:n]
 	b.validityBitmap = resizeBitmap(b.validityBitmap, n)
 }

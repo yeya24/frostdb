@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 )
 
 // The code in this file is based heavily on Apache arrow's array.RecordBuilder,
@@ -28,11 +28,11 @@ func NewRecordBuilder(mem memory.Allocator, schema *arrow.Schema) *RecordBuilder
 		refCount: 1,
 		mem:      mem,
 		schema:   schema,
-		fields:   make([]ColumnBuilder, len(schema.Fields())),
+		fields:   make([]ColumnBuilder, schema.NumFields()),
 	}
 
-	for i, f := range schema.Fields() {
-		b.fields[i] = NewBuilder(mem, f.Type)
+	for i := 0; i < schema.NumFields(); i++ {
+		b.fields[i] = NewBuilder(mem, schema.Field(i).Type)
 	}
 
 	return b
@@ -97,9 +97,11 @@ func (b *RecordBuilder) NewRecord() arrow.Record {
 
 // ExpandSchema expands the record builder schema by adding new fields.
 func (b *RecordBuilder) ExpandSchema(schema *arrow.Schema) {
-	for i, f := range schema.Fields() {
+	for i := 0; i < schema.NumFields(); i++ {
+		f := schema.Field(i)
 		found := false
-		for _, old := range b.schema.Fields() {
+		for j := 0; j < b.schema.NumFields(); j++ {
+			old := b.schema.Field(j)
 			if f.Equal(old) {
 				found = true
 				break
@@ -114,4 +116,15 @@ func (b *RecordBuilder) ExpandSchema(schema *arrow.Schema) {
 	}
 
 	b.schema = schema
+}
+
+// Reset will call ResetFull on any dictionary builders to prevent memo tables from growing unbounded.
+func (b *RecordBuilder) Reset() {
+	for _, f := range b.fields {
+		if lb, ok := f.(*ListBuilder); ok {
+			if vb, ok := lb.ValueBuilder().(array.DictionaryBuilder); ok {
+				vb.ResetFull()
+			}
+		}
+	}
 }

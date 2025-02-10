@@ -1,12 +1,15 @@
 package logicalplan
 
 import (
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/segmentio/parquet-go"
+	"errors"
+	"fmt"
+
+	"github.com/apache/arrow/go/v17/arrow"
 )
 
 type Builder struct {
 	plan *LogicalPlan
+	err  error
 }
 
 func (b Builder) Scan(
@@ -14,6 +17,7 @@ func (b Builder) Scan(
 	tableName string,
 ) Builder {
 	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
 			TableScan: &TableScan{
 				TableProvider: provider,
@@ -28,6 +32,7 @@ func (b Builder) ScanSchema(
 	tableName string,
 ) Builder {
 	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
 			SchemaScan: &SchemaScan{
 				TableProvider: provider,
@@ -41,6 +46,7 @@ func (b Builder) Project(
 	exprs ...Expr,
 ) Builder {
 	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
 			Input: b.plan,
 			Projection: &Projection{
@@ -52,13 +58,20 @@ func (b Builder) Project(
 
 type Visitor interface {
 	PreVisit(expr Expr) bool
+	Visit(expr Expr) bool
 	PostVisit(expr Expr) bool
 }
 
+type ExprTypeFinder interface {
+	DataTypeForExpr(expr Expr) (arrow.DataType, error)
+}
+
 type Expr interface {
-	DataType(*parquet.Schema) (arrow.DataType, error)
+	DataType(ExprTypeFinder) (arrow.DataType, error)
 	Accept(Visitor) bool
 	Name() string
+	Equal(Expr) bool
+	fmt.Stringer
 
 	// ColumnsUsedExprs extracts all the expressions that are used that cause
 	// physical data to be read from a column.
@@ -80,6 +93,9 @@ type Expr interface {
 	// Computed returns whether the expression is computed as opposed to being
 	// a static value or unmodified physical column.
 	Computed() bool
+
+	// Clone returns a deep copy of the expression.
+	Clone() Expr
 }
 
 func (b Builder) Filter(expr Expr) Builder {
@@ -88,6 +104,7 @@ func (b Builder) Filter(expr Expr) Builder {
 	}
 
 	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
 			Input: b.plan,
 			Filter: &Filter{
@@ -101,31 +118,147 @@ func (b Builder) Distinct(
 	exprs ...Expr,
 ) Builder {
 	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
-			Input: b.plan,
 			Distinct: &Distinct{
 				Exprs: exprs,
+			},
+			Input: &LogicalPlan{
+				Projection: &Projection{
+					Exprs: exprs,
+				},
+				Input: b.plan,
+			},
+		},
+	}
+}
+
+func (b Builder) Limit(expr Expr) Builder {
+	if expr == nil {
+		return b
+	}
+
+	return Builder{
+		err: b.err,
+		plan: &LogicalPlan{
+			Input: b.plan,
+			Limit: &Limit{
+				Expr: expr,
 			},
 		},
 	}
 }
 
 func (b Builder) Aggregate(
-	aggExpr []Expr,
+	aggExpr []*AggregationFunction,
 	groupExprs []Expr,
 ) Builder {
+	resolvedAggExpr := make([]*AggregationFunction, 0, len(aggExpr))
+	projectExprs := make([]Expr, 0, len(aggExpr))
+	needsPostProcessing := false
+
+	var err error
+	for _, agg := range aggExpr {
+		resolvedAggregations, projections, changed, rerr := resolveAggregation(b.plan, agg)
+		if err != nil {
+			err = errors.Join(err, rerr)
+		}
+
+		if changed {
+			needsPostProcessing = true
+		}
+
+		resolvedAggExpr = append(resolvedAggExpr, resolvedAggregations...)
+		projectExprs = append(projectExprs, projections...)
+	}
+
+	if !needsPostProcessing {
+		return Builder{
+			err: err,
+			plan: &LogicalPlan{
+				Aggregation: &Aggregation{
+					GroupExprs: groupExprs,
+					AggExprs:   aggExpr,
+				},
+				Input: b.plan,
+			},
+		}
+	}
+
 	return Builder{
+		err: err,
+		plan: &LogicalPlan{
+			Projection: &Projection{
+				Exprs: append(groupExprs, projectExprs...),
+			},
+			Input: &LogicalPlan{
+				Aggregation: &Aggregation{
+					GroupExprs: groupExprs,
+					AggExprs:   resolvedAggExpr,
+				},
+				Input: b.plan,
+			},
+		},
+	}
+}
+
+func resolveAggregation(plan *LogicalPlan, agg *AggregationFunction) ([]*AggregationFunction, []Expr, bool, error) {
+	switch agg.Func {
+	case AggFuncAvg:
+		sum := &AggregationFunction{
+			Func: AggFuncSum,
+			Expr: agg.Expr,
+		}
+		count := &AggregationFunction{
+			Func: AggFuncCount,
+			Expr: agg.Expr,
+		}
+
+		var (
+			countExpr Expr = count
+			aggType   arrow.DataType
+		)
+		aggType, err := agg.Expr.DataType(plan)
+		// intentionally not handling the error here, as it will be handled
+		// in the build function.
+		if !arrow.TypeEqual(aggType, arrow.PrimitiveTypes.Int64) {
+			countExpr = Convert(countExpr, aggType)
+		}
+
+		div := (&BinaryExpr{
+			Left:  sum,
+			Op:    OpDiv,
+			Right: countExpr,
+		}).Alias(agg.String())
+
+		return []*AggregationFunction{sum, count}, []Expr{div}, true, err
+	default:
+		return []*AggregationFunction{agg}, []Expr{agg}, false, nil
+	}
+}
+
+func (b Builder) Sample(expr, limit Expr) Builder {
+	if expr == nil || limit == nil {
+		return b
+	}
+
+	return Builder{
+		err: b.err,
 		plan: &LogicalPlan{
 			Input: b.plan,
-			Aggregation: &Aggregation{
-				GroupExprs: groupExprs,
-				AggExprs:   aggExpr,
+			Sample: &Sample{
+				Expr:  expr,
+				Limit: limit,
 			},
 		},
 	}
 }
 
 func (b Builder) Build() (*LogicalPlan, error) {
+	if b.err != nil {
+		return nil, b.err
+	}
+
 	if err := Validate(b.plan); err != nil {
 		return nil, err
 	}

@@ -10,41 +10,61 @@ var ErrMalformedDynamicColumns = errors.New("malformed dynamic columns string")
 
 func serializeDynamicColumns(dynamicColumns map[string][]string) string {
 	names := make([]string, 0, len(dynamicColumns))
-	for name := range dynamicColumns {
+	var size int
+	for name, cols := range dynamicColumns {
 		names = append(names, name)
+		size += len(name) +
+			2 // separators
+		for i := range cols {
+			size += len(cols[i]) + 1
+		}
 	}
 	sort.Strings(names)
-
-	str := ""
+	var str strings.Builder
+	str.Grow(size)
 	for i, name := range names {
 		if i != 0 {
-			str += ";"
+			str.WriteByte(';')
 		}
-		str += name + ":" + strings.Join(dynamicColumns[name], ",")
+		str.WriteString(name)
+		str.WriteByte(':')
+		for j := range dynamicColumns[name] {
+			if j != 0 {
+				str.WriteByte(',')
+			}
+			str.WriteString(dynamicColumns[name][j])
+		}
 	}
-
-	return str
+	return str.String()
 }
 
-func deserializeDynamicColumns(dynColString string) (map[string][]string, error) {
+func deserializeDynamicColumns(columns string) (map[string][]string, error) {
 	dynCols := map[string][]string{}
 
 	// handle case where the schema has no dynamic columnns
-	if len(dynColString) == 0 {
+	if len(columns) == 0 {
 		return dynCols, nil
 	}
-
-	for _, dynString := range strings.Split(dynColString, ";") {
-		split := strings.Split(dynString, ":")
-		if len(split) != 2 {
+	var column string
+	for {
+		if columns == "" {
+			return dynCols, nil
+		}
+		column, columns, _ = strings.Cut(columns, ";")
+		name, labels, ok := strings.Cut(column, ":")
+		if !ok {
 			return nil, ErrMalformedDynamicColumns
 		}
-		labelValues := strings.Split(split[1], ",")
-		if len(labelValues) == 1 && labelValues[0] == "" {
-			labelValues = []string{}
-		}
-		dynCols[split[0]] = labelValues
-	}
+		values := make([]string, 0, strings.Count(labels, ","))
 
-	return dynCols, nil
+		var label string
+		for {
+			if labels == "" {
+				break
+			}
+			label, labels, _ = strings.Cut(labels, ",")
+			values = append(values, label)
+		}
+		dynCols[name] = values
+	}
 }

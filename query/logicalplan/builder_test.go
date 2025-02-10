@@ -3,7 +3,7 @@ package logicalplan
 import (
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow/scalar"
+	"github.com/apache/arrow/go/v17/arrow/scalar"
 	"github.com/stretchr/testify/require"
 
 	"github.com/polarsignals/frostdb/dynparquet"
@@ -15,10 +15,10 @@ func TestLogicalPlanBuilder(t *testing.T) {
 		Scan(tableProvider, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
-		Project(Col("stacktrace")).
+		Project(Col("stacktrace"), Sum(Col("value")).Alias("value_sum")).
 		Build()
 
 	require.Nil(t, err)
@@ -27,15 +27,16 @@ func TestLogicalPlanBuilder(t *testing.T) {
 		Projection: &Projection{
 			Exprs: []Expr{
 				&Column{ColumnName: "stacktrace"},
+				&AliasExpr{
+					Expr:  &AggregationFunction{Func: AggFuncSum, Expr: &Column{ColumnName: "value"}},
+					Alias: "value_sum",
+				},
 			},
 		},
 		Input: &LogicalPlan{
 			Aggregation: &Aggregation{
 				GroupExprs: []Expr{&Column{ColumnName: "stacktrace"}},
-				AggExprs: []Expr{&AliasExpr{
-					Expr:  &AggregationFunction{Func: AggFuncSum, Expr: &Column{ColumnName: "value"}},
-					Alias: "value_sum",
-				}},
+				AggExprs:   []*AggregationFunction{{Func: AggFuncSum, Expr: &Column{ColumnName: "value"}}},
 			},
 			Input: &LogicalPlan{
 				Filter: &Filter{
@@ -68,10 +69,33 @@ func TestLogicalPlanBuilderWithoutProjection(t *testing.T) {
 			Exprs: []Expr{&Column{ColumnName: "labels.test"}},
 		},
 		Input: &LogicalPlan{
-			TableScan: &TableScan{
-				TableProvider: tableProvider,
-				TableName:     "table1",
+			Projection: &Projection{
+				Exprs: []Expr{&Column{ColumnName: "labels.test"}},
+			},
+			Input: &LogicalPlan{
+				TableScan: &TableScan{
+					TableProvider: tableProvider,
+					TableName:     "table1",
+				},
 			},
 		},
 	}, p)
+}
+
+func TestRenamedColumn(t *testing.T) {
+	tableProvider := &mockTableProvider{schema: dynparquet.NewSampleSchema()}
+	_, err := (&Builder{}).
+		Scan(tableProvider, "table1").
+		Filter(Col("labels.test").Eq(Literal("abc"))).
+		Project(
+			Div(Mul(Col("value"), Literal(int64(2))), Literal(int64(2))).Alias("other_value"),
+			Col("stacktrace"),
+		).
+		Aggregate(
+			[]*AggregationFunction{Sum(Col("other_value"))},
+			[]Expr{Col("stacktrace")},
+		).
+		Project(Col("stacktrace"), Sum(Col("other_value")).Alias("value_sum")).
+		Build()
+	require.NoError(t, err)
 }

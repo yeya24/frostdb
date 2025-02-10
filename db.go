@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,15 +15,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/apache/arrow/go/v10/arrow/ipc"
+	"github.com/apache/arrow/go/v17/arrow/ipc"
+	"github.com/apache/arrow/go/v17/arrow/util"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/google/btree"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/thanos-io/objstore"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+	"golang.org/x/exp/maps"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/protobuf/proto"
 
@@ -31,37 +32,53 @@ import (
 	schemav2pb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha2"
 	tablepb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/table/v1alpha1"
 	walpb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/wal/v1alpha1"
+	"github.com/polarsignals/frostdb/index"
+	"github.com/polarsignals/frostdb/parts"
 	"github.com/polarsignals/frostdb/query/logicalplan"
-	"github.com/polarsignals/frostdb/storage"
 	"github.com/polarsignals/frostdb/wal"
 )
 
+const (
+	B   = 1
+	KiB = 1024 * B
+	MiB = 1024 * KiB
+	GiB = 1024 * MiB
+	TiB = 1024 * GiB
+)
+
 type ColumnStore struct {
-	mtx                  *sync.RWMutex
-	dbs                  map[string]*DB
-	reg                  prometheus.Registerer
-	logger               log.Logger
-	tracer               trace.Tracer
-	granuleSizeBytes     int64
-	activeMemorySize     int64
-	storagePath          string
-	bucket               storage.Bucket
-	ignoreStorageOnQuery bool
-	enableWAL            bool
-	compactionConfig     *CompactionConfig
-	snapshotTriggerSize  int64
-	metrics              metrics
+	mtx                 sync.RWMutex
+	dbs                 map[string]*DB
+	dbReplaysInProgress map[string]chan struct{}
+	reg                 prometheus.Registerer
+	logger              log.Logger
+	tracer              trace.Tracer
+	activeMemorySize    int64
+	storagePath         string
+	enableWAL           bool
+	manualBlockRotation bool
+	snapshotTriggerSize int64
+	metrics             globalMetrics
+	recoveryConcurrency int
 
 	// indexDegree is the degree of the btree index (default = 2)
 	indexDegree int
 	// splitSize is the number of new granules that are created when granules are split (default =2)
 	splitSize int
-}
+	// indexConfig is the configuration settings for the lsm index
+	indexConfig []*index.LevelConfig
 
-type metrics struct {
-	shutdownDuration  prometheus.Histogram
-	shutdownStarted   prometheus.Counter
-	shutdownCompleted prometheus.Counter
+	sources []DataSource
+	sinks   []DataSink
+
+	compactAfterRecovery           bool
+	compactAfterRecoveryTableNames []string
+
+	// testingOptions are options only used for testing purposes.
+	testingOptions struct {
+		disableReclaimDiskSpaceOnSnapshot bool
+		walTestingOptions                 []wal.Option
+	}
 }
 
 type Option func(*ColumnStore) error
@@ -70,16 +87,15 @@ func New(
 	options ...Option,
 ) (*ColumnStore, error) {
 	s := &ColumnStore{
-		mtx:              &sync.RWMutex{},
-		dbs:              map[string]*DB{},
-		reg:              prometheus.NewRegistry(),
-		logger:           log.NewNopLogger(),
-		tracer:           trace.NewNoopTracerProvider().Tracer(""),
-		indexDegree:      2,
-		splitSize:        2,
-		granuleSizeBytes: 1 * 1024 * 1024,   // 1MB granule size before splitting
-		activeMemorySize: 512 * 1024 * 1024, // 512MB
-		compactionConfig: NewCompactionConfig(),
+		dbs:                 make(map[string]*DB),
+		dbReplaysInProgress: make(map[string]chan struct{}),
+		reg:                 prometheus.NewRegistry(),
+		logger:              log.NewNopLogger(),
+		tracer:              noop.NewTracerProvider().Tracer(""),
+		indexConfig:         DefaultIndexConfig(),
+		indexDegree:         2,
+		splitSize:           2,
+		activeMemorySize:    512 * MiB,
 	}
 
 	for _, option := range options {
@@ -88,23 +104,20 @@ func New(
 		}
 	}
 
-	s.metrics = metrics{
-		shutdownDuration: promauto.With(s.reg).NewHistogram(prometheus.HistogramOpts{
-			Name: "shutdown_duration",
-			Help: "time it takes for the columnarstore to complete a full shutdown.",
-		}),
-		shutdownStarted: promauto.With(s.reg).NewCounter(prometheus.CounterOpts{
-			Name: "shutdown_started",
-			Help: "Indicates a shutdown of the columnarstore has started.",
-		}),
-		shutdownCompleted: promauto.With(s.reg).NewCounter(prometheus.CounterOpts{
-			Name: "shutdown_completed",
-			Help: "Indicates a shutdown of the columnarstore has completed.",
-		}),
-	}
+	// Register metrics that are updated by the collector.
+	s.reg.MustRegister(&collector{s: s})
+	s.metrics = makeAndRegisterGlobalMetrics(s.reg)
 
 	if s.enableWAL && s.storagePath == "" {
 		return nil, fmt.Errorf("storage path must be configured if WAL is enabled")
+	}
+
+	for _, cfg := range s.indexConfig {
+		if cfg.Type == index.CompactionTypeParquetDisk {
+			if !s.enableWAL || s.storagePath == "" {
+				return nil, fmt.Errorf("persistent disk compaction requires WAL and storage path to be enabled")
+			}
+		}
 	}
 
 	if err := s.recoverDBsFromStorage(context.Background()); err != nil {
@@ -135,13 +148,6 @@ func WithRegistry(reg prometheus.Registerer) Option {
 	}
 }
 
-func WithGranuleSizeBytes(bytes int64) Option {
-	return func(s *ColumnStore) error {
-		s.granuleSizeBytes = bytes
-		return nil
-	}
-}
-
 func WithActiveMemorySize(size int64) Option {
 	return func(s *ColumnStore) error {
 		s.activeMemorySize = size
@@ -163,16 +169,31 @@ func WithSplitSize(size int) Option {
 	}
 }
 
-func WithBucketStorage(bucket objstore.Bucket) Option {
+func WithReadWriteStorage(ds DataSinkSource) Option {
 	return func(s *ColumnStore) error {
-		s.bucket = storage.NewBucketReaderAt(bucket)
+		s.sources = append(s.sources, ds)
+		s.sinks = append(s.sinks, ds)
 		return nil
 	}
 }
 
-func WithStorage(bucket storage.Bucket) Option {
+func WithReadOnlyStorage(ds DataSource) Option {
 	return func(s *ColumnStore) error {
-		s.bucket = bucket
+		s.sources = append(s.sources, ds)
+		return nil
+	}
+}
+
+func WithWriteOnlyStorage(ds DataSink) Option {
+	return func(s *ColumnStore) error {
+		s.sinks = append(s.sinks, ds)
+		return nil
+	}
+}
+
+func WithManualBlockRotation() Option {
+	return func(s *ColumnStore) error {
+		s.manualBlockRotation = true
 		return nil
 	}
 }
@@ -191,30 +212,48 @@ func WithStoragePath(path string) Option {
 	}
 }
 
-// WithIgnoreStorageOnQuery storage paths aren't included in queries.
-func WithIgnoreStorageOnQuery() Option {
+func WithIndexConfig(indexConfig []*index.LevelConfig) Option {
 	return func(s *ColumnStore) error {
-		s.ignoreStorageOnQuery = true
+		s.indexConfig = indexConfig
 		return nil
 	}
 }
 
-func WithCompactionConfig(c *CompactionConfig) Option {
+func WithCompactionAfterRecovery(tableNames []string) Option {
 	return func(s *ColumnStore) error {
-		s.compactionConfig = c
+		s.compactAfterRecovery = true
+		s.compactAfterRecoveryTableNames = tableNames
 		return nil
 	}
 }
 
-// WithSnapshotTriggerSize specifies a table block size in bytes that will
-// trigger a snapshot of the whole database. This should be less than the active
-// memory size. If 0, snapshots are disabled. Note that snapshots (if enabled)
-// are also triggered on block rotation of any database table.
+// WithSnapshotTriggerSize specifies a size in bytes of uncompressed inserts
+// that will trigger a snapshot of the whole database. This can be larger than
+// the active memory size given that the active memory size tracks the size of
+// *compressed* data, while snapshots are triggered based on the *uncompressed*
+// data inserted into the database. The reason this choice was made is that
+// if a database instance crashes, it is forced to reread all uncompressed
+// inserts since the last snapshot from the WAL, which could potentially lead
+// to unrecoverable OOMs on startup. Defining the snapshot trigger in terms of
+// uncompressed bytes limits the memory usage on recovery to at most the
+// snapshot trigger size (as long as snapshots were successful).
+// If 0, snapshots are disabled. Note that snapshots (if enabled) are also
+// triggered on block rotation of any database table.
 // Snapshots are complementary to the WAL and will also be disabled if the WAL
 // is disabled.
 func WithSnapshotTriggerSize(size int64) Option {
 	return func(s *ColumnStore) error {
 		s.snapshotTriggerSize = size
+		return nil
+	}
+}
+
+// WithRecoveryConcurrency limits the number of databases that are recovered
+// simultaneously when calling frostdb.New. This helps limit memory usage on
+// recovery.
+func WithRecoveryConcurrency(concurrency int) Option {
+	return func(s *ColumnStore) error {
+		s.recoveryConcurrency = concurrency
 		return nil
 	}
 }
@@ -233,7 +272,14 @@ func (s *ColumnStore) Close() error {
 	errg := &errgroup.Group{}
 	errg.SetLimit(runtime.GOMAXPROCS(0))
 	for _, db := range s.dbs {
-		errg.Go(db.Close)
+		toClose := db
+		errg.Go(func() error {
+			err := toClose.Close()
+			if err != nil {
+				level.Error(s.logger).Log("msg", "error closing DB", "db", toClose.name, "err", err)
+			}
+			return err
+		})
 	}
 
 	return errg.Wait()
@@ -264,11 +310,21 @@ func (s *ColumnStore) recoverDBsFromStorage(ctx context.Context) error {
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
+	// Limit this operation since WAL recovery could be very memory intensive.
+	if s.recoveryConcurrency == 0 {
+		s.recoveryConcurrency = runtime.GOMAXPROCS(0)
+	}
+	g.SetLimit(s.recoveryConcurrency)
 	for _, f := range files {
 		databaseName := f.Name()
 		g.Go(func() error {
 			// Open the DB for the side effect of the snapshot and WALs being loaded as part of the open operation.
-			_, err := s.DB(ctx, databaseName)
+			_, err := s.DB(ctx,
+				databaseName,
+				WithCompactionAfterOpen(
+					s.compactAfterRecovery, s.compactAfterRecoveryTableNames,
+				),
+			)
 			return err
 		})
 	}
@@ -276,15 +332,8 @@ func (s *ColumnStore) recoverDBsFromStorage(ctx context.Context) error {
 	return g.Wait()
 }
 
-type dbMetrics struct {
-	txHighWatermark    prometheus.GaugeFunc
-	snapshotsStarted   prometheus.Counter
-	snapshotsCompleted prometheus.Counter
-}
-
 type DB struct {
 	columnStore *ColumnStore
-	reg         prometheus.Registerer
 	logger      log.Logger
 	tracer      trace.Tracer
 	name        string
@@ -293,34 +342,84 @@ type DB struct {
 	roTables map[string]*Table
 	tables   map[string]*Table
 
-	storagePath          string
-	wal                  WAL
-	bucket               storage.Bucket
-	ignoreStorageOnQuery bool
+	storagePath string
+	wal         WAL
+
+	// The database supports multiple data sources and sinks.
+	sources []DataSource
+	sinks   []DataSink
+
 	// Databases monotonically increasing transaction id
-	tx *atomic.Uint64
+	tx atomic.Uint64
+	// highWatermark maintains the highest consecutively completed txn.
+	highWatermark atomic.Uint64
 
 	// TxPool is a waiting area for finished transactions that haven't been added to the watermark
 	txPool *TxPool
 
-	compactorPool *compactorPool
-
-	// highWatermark maintains the highest consecutively completed tx number
-	highWatermark *atomic.Uint64
+	compactAfterRecovery           bool
+	compactAfterRecoveryTableNames []string
 
 	snapshotInProgress atomic.Bool
 
-	metrics *dbMetrics
+	metrics         snapshotMetrics
+	metricsProvider tableMetricsProvider
 }
 
-func (s *ColumnStore) DB(ctx context.Context, name string) (*DB, error) {
+// DataSinkSource is a convenience interface for a data source and sink.
+type DataSinkSource interface {
+	DataSink
+	DataSource
+}
+
+// DataSource is remote source of data that can be queried.
+type DataSource interface {
+	fmt.Stringer
+	Scan(ctx context.Context, prefix string, schema *dynparquet.Schema, filter logicalplan.Expr, lastBlockTimestamp uint64, callback func(context.Context, any) error) error
+	Prefixes(ctx context.Context, prefix string) ([]string, error)
+}
+
+// DataSink is a remote destination for data.
+type DataSink interface {
+	fmt.Stringer
+	Upload(ctx context.Context, name string, r io.Reader) error
+	Delete(ctx context.Context, name string) error
+}
+
+type DBOption func(*DB) error
+
+func WithCompactionAfterOpen(compact bool, tableNames []string) DBOption {
+	return func(db *DB) error {
+		db.compactAfterRecovery = compact
+		db.compactAfterRecoveryTableNames = tableNames
+		return nil
+	}
+}
+
+// DB gets or creates a database on the given ColumnStore with the given
+// options. Note that if the database already exists, the options will be
+// applied cumulatively to the database.
+func (s *ColumnStore) DB(ctx context.Context, name string, opts ...DBOption) (*DB, error) {
 	if !validateName(name) {
 		return nil, errors.New("invalid database name")
+	}
+	applyOptsToDB := func(db *DB) error {
+		db.mtx.Lock()
+		defer db.mtx.Unlock()
+		for _, opt := range opts {
+			if err := opt(db); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	s.mtx.RLock()
 	db, ok := s.dbs[name]
 	s.mtx.RUnlock()
 	if ok {
+		if err := applyOptsToDB(db); err != nil {
+			return nil, err
+		}
 		return db, nil
 	}
 
@@ -329,108 +428,202 @@ func (s *ColumnStore) DB(ctx context.Context, name string) (*DB, error) {
 
 	// Need to double-check that in the meantime a database with the same name
 	// wasn't concurrently created.
-	db, ok = s.dbs[name]
-	if ok {
-		return db, nil
+	for {
+		db, ok = s.dbs[name]
+		if ok {
+			if err := applyOptsToDB(db); err != nil {
+				return nil, err
+			}
+			return db, nil
+		}
+
+		// DB has not yet been created. However, another goroutine might be
+		// replaying the WAL in the background (the store mutex is released
+		// during replay.).
+		waitForReplay, ok := s.dbReplaysInProgress[name]
+		if !ok {
+			// No replay in progress, it is safe to create the DB.
+			break
+		}
+		s.mtx.Unlock()
+		<-waitForReplay
+		s.mtx.Lock()
 	}
 
-	reg := prometheus.WrapRegistererWith(prometheus.Labels{"db": name}, s.reg)
 	logger := log.WithPrefix(s.logger, "db", name)
 	db = &DB{
-		columnStore:          s,
-		name:                 name,
-		mtx:                  &sync.RWMutex{},
-		tables:               map[string]*Table{},
-		roTables:             map[string]*Table{},
-		reg:                  reg,
-		logger:               logger,
-		tracer:               s.tracer,
-		tx:                   &atomic.Uint64{},
-		highWatermark:        &atomic.Uint64{},
-		storagePath:          filepath.Join(s.DatabasesDir(), name),
-		wal:                  &wal.NopWAL{},
-		ignoreStorageOnQuery: s.ignoreStorageOnQuery,
+		columnStore:     s,
+		name:            name,
+		mtx:             &sync.RWMutex{},
+		tables:          map[string]*Table{},
+		roTables:        map[string]*Table{},
+		logger:          logger,
+		tracer:          s.tracer,
+		wal:             &wal.NopWAL{},
+		sources:         s.sources,
+		sinks:           s.sinks,
+		metrics:         s.metrics.snapshotMetricsForDB(name),
+		metricsProvider: tableMetricsProvider{dbName: name, m: s.metrics},
 	}
 
-	if s.bucket != nil {
-		db.bucket = storage.NewPrefixedBucket(s.bucket, db.name)
+	if s.storagePath != "" {
+		db.storagePath = filepath.Join(s.DatabasesDir(), name)
+	}
+
+	if err := applyOptsToDB(db); err != nil {
+		return nil, err
 	}
 
 	if dbSetupErr := func() error {
-		db.txPool = NewTxPool(db.highWatermark)
-		db.compactorPool = newCompactorPool(db, s.compactionConfig)
-		// If bucket storage is configured; scan for existing tables in the database
-		if db.bucket != nil {
-			if err := db.bucket.Iter(ctx, "", func(tableName string) error {
-				_, err := db.readOnlyTable(strings.TrimSuffix(tableName, "/"))
+		if db.storagePath != "" {
+			if err := os.RemoveAll(db.trashDir()); err != nil {
+				return err
+			}
+			if err := os.RemoveAll(db.indexDir()); err != nil { // Remove the index directory. These are either restored from snapshots or rebuilt from the WAL.
+				return err
+			}
+		}
+		db.txPool = NewTxPool(&db.highWatermark)
+		// Wait to start the compactor pool since benchmarks show that WAL
+		// replay is a lot more efficient if it is not competing against
+		// compaction. Additionally, if the CompactAfterRecovery option is
+		// specified, we don't want the user-specified compaction to race with
+		// our compactor pool.
+		if len(db.sources) != 0 {
+			for _, source := range db.sources {
+				prefixes, err := source.Prefixes(ctx, name)
 				if err != nil {
 					return err
 				}
 
-				return nil
-			}); err != nil {
-				return fmt.Errorf("bucket iter on database open: %w", err)
+				for _, prefix := range prefixes {
+					_, err := db.readOnlyTable(prefix)
+					if err != nil {
+						return err
+					}
+				}
 			}
 		}
 
 		if s.enableWAL {
-			var err error
-			db.wal, err = db.openWAL(ctx)
-			if err != nil {
+			if err := func() error {
+				// Unlock the store mutex while the WAL is replayed, otherwise
+				// if multiple DBs are opened in parallel, WAL replays will not
+				// happen in parallel. However, create a channel for any
+				// goroutines that might concurrently try to open the same DB
+				// to listen on.
+				s.dbReplaysInProgress[name] = make(chan struct{})
+				s.mtx.Unlock()
+				defer func() {
+					s.mtx.Lock()
+					close(s.dbReplaysInProgress[name])
+					delete(s.dbReplaysInProgress, name)
+				}()
+				var err error
+				db.wal, err = db.openWAL(
+					ctx,
+					append(
+						[]wal.Option{
+							wal.WithMetrics(s.metrics.metricsForFileWAL(name)),
+							wal.WithStoreMetrics(s.metrics.metricsForWAL(name)),
+						}, s.testingOptions.walTestingOptions...,
+					)...,
+				)
+				return err
+			}(); err != nil {
 				return err
 			}
 			// WAL pointers of tables need to be updated to the DB WAL since
 			// they are loaded from object storage and snapshots with a no-op
 			// WAL by default.
 			for _, table := range db.tables {
-				if !table.config.DisableWal {
+				if !table.config.Load().DisableWal {
 					table.wal = db.wal
 				}
 			}
 			for _, table := range db.roTables {
-				if !table.config.DisableWal {
+				if !table.config.Load().DisableWal {
 					table.wal = db.wal
 				}
 			}
 		}
-
-		// Register metrics last to avoid duplicate registration should and of the WAL or storage replay errors occur
-		db.metrics = &dbMetrics{
-			txHighWatermark: promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
-				Name: "tx_high_watermark",
-				Help: "The highest transaction number that has been released to be read",
-			}, func() float64 {
-				return float64(db.highWatermark.Load())
-			}),
-		}
-		if db.columnStore.snapshotTriggerSize != 0 {
-			db.metrics.snapshotsStarted = promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "snapshots_started",
-				Help: "Number of snapshots started",
-			})
-			db.metrics.snapshotsCompleted = promauto.With(reg).NewCounter(prometheus.CounterOpts{
-				Name: "snapshots_completed",
-				Help: "Number of snapshots completed",
-			})
-		}
 		return nil
 	}(); dbSetupErr != nil {
+		level.Warn(s.logger).Log(
+			"msg", "error setting up db",
+			"name", name,
+			"err", dbSetupErr,
+		)
 		// closeInternal handles closing partially set fields in the db without
 		// rotating blocks etc... that the public Close method does.
 		_ = db.closeInternal()
 		return nil, dbSetupErr
 	}
 
-	db.compactorPool.start()
+	// Compact tables after recovery if requested.
+	if db.compactAfterRecovery {
+		tables := db.compactAfterRecoveryTableNames
+		if len(tables) == 0 {
+			// Run compaction on all tables.
+			tables = maps.Keys(db.tables)
+		}
+		for _, name := range tables {
+			tbl, err := db.GetTable(name)
+			if err != nil {
+				level.Warn(db.logger).Log("msg", "get table during db setup", "err", err)
+				continue
+			}
+
+			start := time.Now()
+			if err := tbl.EnsureCompaction(); err != nil {
+				level.Warn(db.logger).Log("msg", "compaction during setup", "err", err)
+			}
+			level.Info(db.logger).Log(
+				"msg", "compacted table after recovery", "table", name, "took", time.Since(start),
+			)
+		}
+	}
+
 	s.dbs[name] = db
 	return db, nil
 }
 
-func (db *DB) openWAL(ctx context.Context) (WAL, error) {
+// DBs returns all the DB names of this column store.
+func (s *ColumnStore) DBs() []string {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	return maps.Keys(s.dbs)
+}
+
+func (s *ColumnStore) GetDB(name string) (*DB, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	db, ok := s.dbs[name]
+	if !ok {
+		return nil, fmt.Errorf("db %s not found", name)
+	}
+	return db, nil
+}
+
+func (s *ColumnStore) DropDB(name string) error {
+	db, err := s.GetDB(name)
+	if err != nil {
+		return err
+	}
+	if err := db.Close(WithClearStorage()); err != nil {
+		return err
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	delete(s.dbs, name)
+	return os.RemoveAll(filepath.Join(s.DatabasesDir(), name))
+}
+
+func (db *DB) openWAL(ctx context.Context, opts ...wal.Option) (WAL, error) {
 	wal, err := wal.Open(
 		db.logger,
-		db.reg,
 		db.walDir(),
+		opts...,
 	)
 	if err != nil {
 		return nil, err
@@ -444,16 +637,36 @@ func (db *DB) openWAL(ctx context.Context) (WAL, error) {
 	return wal, nil
 }
 
+const (
+	walPath       = "wal"
+	snapshotsPath = "snapshots"
+	indexPath     = "index"
+	trashPath     = "trash"
+)
+
 func (db *DB) walDir() string {
-	return filepath.Join(db.storagePath, "wal")
+	return filepath.Join(db.storagePath, walPath)
 }
 
 func (db *DB) snapshotsDir() string {
-	return filepath.Join(db.storagePath, "snapshots")
+	return filepath.Join(db.storagePath, snapshotsPath)
 }
 
-// recover attempts to recover database state from a combination of snapshots
-// and the WAL.
+func (db *DB) trashDir() string {
+	return filepath.Join(db.storagePath, trashPath)
+}
+
+func (db *DB) indexDir() string {
+	return filepath.Join(db.storagePath, indexPath)
+}
+
+// recover attempts to recover database state from a combination of snapshots and the WAL.
+//
+// The recovery process is as follows:
+// 1. Load the latest snapshot (if one should exist).
+// 1.a. If on-disk LSM index files exist: Upon table creation during snapshot loading, the index files shall be recovered from, inserting parts into the index.
+// 2. Replay the WAL starting from the latest snapshot transaction.
+// 2.a. If on-disk LSM index files were loaded: Insertion into the index may drop the insertion if a part with a higher transaction already exists in the WAL.
 func (db *DB) recover(ctx context.Context, wal WAL) error {
 	level.Info(db.logger).Log(
 		"msg", "recovering db",
@@ -467,18 +680,6 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 		)
 		snapshotTx = 0
 	}
-	firstIndex, err := wal.FirstIndex()
-	if err != nil {
-		level.Info(db.logger).Log(
-			"msg", "failed to get WAL first index",
-			"err", err)
-	}
-	lastIndex, err := wal.LastIndex()
-	if err != nil {
-		level.Info(db.logger).Log(
-			"msg", "failed to get WAL last index",
-			"err", err)
-	}
 	snapshotLogArgs := make([]any, 0)
 	if snapshotTx != 0 {
 		snapshotLogArgs = append(
@@ -486,60 +687,41 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 			"snapshot_tx", snapshotTx,
 			"snapshot_load_duration", time.Since(snapshotLoadStart),
 		)
-		if err := db.truncateSnapshotsLessThanTX(ctx, snapshotTx); err != nil {
+		if err := db.cleanupSnapshotDir(ctx, snapshotTx); err != nil {
 			// Truncation is best-effort. If it fails, move on.
 			level.Info(db.logger).Log(
-				"msg", "failed to truncate snapshots less than loaded snapshot",
+				"msg", "failed to truncate snapshots not equal to loaded snapshot",
 				"err", err,
 				"snapshot_tx", snapshotTx,
 			)
 		}
-		if snapshotTx > firstIndex && snapshotTx <= lastIndex {
-			if err := wal.Truncate(snapshotTx); err != nil {
-				// Since this is a best-effort truncation, move on if there is an
-				// error.
-				level.Info(db.logger).Log(
-					"msg", "WAL truncation after successful snapshot load encountered error",
-					"err", err,
-					"first_index", firstIndex,
-					"last_index", lastIndex,
-					"snapshot_tx", snapshotTx,
-				)
-			} else {
-				snapshotLogArgs = append(
-					snapshotLogArgs,
-					"wal_truncated", "true",
-					"wal_first_index_pre_truncation", firstIndex)
-				firstIndex = snapshotTx
-			}
-		} else {
-			snapshotLogArgs = append(
-				snapshotLogArgs,
-				"wal_truncated", "false",
+		// snapshotTx can correspond to a write at that txn that is contained in
+		// the snapshot. We want the first entry of the WAL to be the subsequent
+		// txn to not replay duplicate writes.
+		if err := wal.Truncate(snapshotTx + 1); err != nil {
+			level.Info(db.logger).Log(
+				"msg", "failed to truncate WAL after loading snapshot",
+				"err", err,
+				"snapshot_tx", snapshotTx,
 			)
 		}
 	}
 
 	// persistedTables is a map from a table name to the last transaction
 	// persisted.
-	persistedTables := map[string]uint64{}
-	lastTx := uint64(0)
+	persistedTables := make(map[string]uint64)
+	var lastTx uint64
 
 	start := time.Now()
-	if err := wal.Replay(snapshotTx, func(tx uint64, record *walpb.Record) error {
+	if err := wal.Replay(snapshotTx+1, func(_ uint64, record *walpb.Record) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		switch e := record.Entry.EntryType.(type) {
 		case *walpb.Entry_TableBlockPersisted_:
-			persistedTables[e.TableBlockPersisted.TableName] = tx
-			if tx > snapshotTx {
-				// The loaded snapshot has data in a table that has been
-				// persisted. Delete all data in this table, since it has
-				// already been persisted.
-				db.mtx.Lock()
-				if table, ok := db.tables[e.TableBlockPersisted.TableName]; ok {
-					table.ActiveBlock().index.Store(btree.New(table.db.columnStore.indexDegree))
-				}
-				db.mtx.Unlock()
-			}
+			persistedTables[e.TableBlockPersisted.TableName] = e.TableBlockPersisted.NextTx
+			// The loaded snapshot might have persisted data, this is handled in
+			// the replay loop below.
 			return nil
 		default:
 			return nil
@@ -548,7 +730,15 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 		return err
 	}
 
-	if err := wal.Replay(snapshotTx, func(tx uint64, record *walpb.Record) error {
+	// performSnapshot is set to true if a snapshot should be performed after
+	// replay. This is set in cases where there could be "dead bytes" in the
+	// WAL (i.e. entries that occupy space on disk but are useless).
+	performSnapshot := false
+
+	if err := wal.Replay(snapshotTx+1, func(tx uint64, record *walpb.Record) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		lastTx = tx
 		switch e := record.Entry.EntryType.(type) {
 		case *walpb.Entry_NewTableBlock_:
@@ -568,9 +758,11 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 				return err
 			}
 
-			if lastPersistedTx, ok := persistedTables[entry.TableName]; ok && tx < lastPersistedTx {
+			nextNonPersistedTxn, wasPersisted := persistedTables[entry.TableName]
+			if wasPersisted && tx < nextNonPersistedTxn {
 				// This block has already been successfully persisted, so we can
-				// skip it.
+				// skip it. Note that if this new table block is the active
+				// block after persistence tx == nextNonPersistedTxn.
 				return nil
 			}
 
@@ -578,53 +770,63 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 			table, err := db.GetTable(tableName)
 			var tableErr ErrTableNotFound
 			if errors.As(err, &tableErr) {
-				config := NewTableConfig(schema, FromConfig(entry.Config))
-				// TODO: May be we should acquire mutux lock when mutating d.roTables and d.tables?
-				// s.DB creates read only Table instance when BucketStore is configured.
-				// Make sure to use the existing Table instace instead of creating new one to avoid dangling instance.
-				table, ok := db.roTables[tableName]
-				if ok {
-					delete(db.roTables, tableName)
-					table.config = config
-				} else {
-					table, err = newTable(
-						db,
-						tableName,
-						config,
-						db.reg,
-						db.logger,
-						db.tracer,
-						wal,
-					)
-					if err != nil {
-						return fmt.Errorf("instantiate table: %w", err)
+				return func() error {
+					db.mtx.Lock()
+					defer db.mtx.Unlock()
+					config := NewTableConfig(schema, FromConfig(entry.Config))
+					if _, ok := db.roTables[tableName]; ok {
+						table, err = db.promoteReadOnlyTableLocked(tableName, config)
+						if err != nil {
+							return fmt.Errorf("promoting read only table: %w", err)
+						}
+					} else {
+						table, err = newTable(
+							db,
+							tableName,
+							config,
+							db.metricsProvider.metricsForTable(tableName),
+							db.logger,
+							db.tracer,
+							wal,
+						)
+						if err != nil {
+							return fmt.Errorf("instantiate table: %w", err)
+						}
 					}
-				}
 
-				table.active, err = newTableBlock(table, 0, tx, id)
-				if err != nil {
-					return err
-				}
-				db.mtx.Lock()
-				db.tables[tableName] = table
-				db.mtx.Unlock()
-				return nil
+					table.active, err = newTableBlock(table, 0, tx, id)
+					if err != nil {
+						return err
+					}
+					db.tables[tableName] = table
+					return nil
+				}()
 			}
 			if err != nil {
 				return fmt.Errorf("get table: %w", err)
 			}
 
-			// If we get to this point it means a block was finished but did
-			// not get persisted.
-			table.pendingBlocks[table.active] = struct{}{}
-			go table.writeBlock(table.active, false /* snapshotDB */)
+			level.Info(db.logger).Log(
+				"msg", "writing unfinished block in recovery",
+				"table", tableName,
+				"tx", tx,
+			)
+			if snapshotTx == 0 || tx != nextNonPersistedTxn {
+				// If we get to this point it means a block was finished but did
+				// not get persisted. If a snapshot was loaded, then the table
+				// already exists but the active block is outdated. If
+				// tx == nextNonPersistedTxn, we should not persist the active
+				// block, but just create a new block.
+				table.pendingBlocks[table.active] = struct{}{}
+				go table.writeBlock(table.active, tx, db.columnStore.manualBlockRotation)
+			}
 
 			protoEqual := false
 			switch schema.(type) {
 			case *schemav2pb.Schema:
-				protoEqual = proto.Equal(schema, table.config.GetSchemaV2())
+				protoEqual = proto.Equal(schema, table.config.Load().GetSchemaV2())
 			case *schemapb.Schema:
-				protoEqual = proto.Equal(schema, table.config.GetDeprecatedSchema())
+				protoEqual = proto.Equal(schema, table.config.Load().GetDeprecatedSchema())
 			}
 			if !protoEqual {
 				// If schemas are identical from block to block we should we
@@ -673,26 +875,18 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 				if err != nil {
 					return fmt.Errorf("read record: %w", err)
 				}
-
-				if err := table.active.InsertRecord(ctx, tx, record); err != nil {
-					return fmt.Errorf("insert record into block: %w", err)
-				}
+				defer reader.Release()
+				size := util.TotalRecordSize(record)
+				table.active.index.InsertPart(parts.NewArrowPart(tx, record, uint64(size), table.schema, parts.WithCompactionLevel(int(index.L0))))
 			default:
-				serBuf, err := dynparquet.ReaderFromBytes(entry.Data)
-				if err != nil {
-					return fmt.Errorf("deserialize buffer: %w", err)
-				}
-
-				if err := table.active.Insert(ctx, tx, serBuf); err != nil {
-					return fmt.Errorf("insert buffer into block: %w", err)
-				}
+				panic("parquet writes are deprecated")
 			}
-
-			// After every insert we're setting the tx and highWatermark to the replayed tx.
-			// This allows the block's compaction to start working on the inserted data.
-			db.tx.Store(tx)
-			db.highWatermark.Store(tx)
+			return nil
 		case *walpb.Entry_TableBlockPersisted_:
+			// If a block was persisted but the entry still exists in the WAL,
+			// a snapshot was not performed after persisting the block. Perform
+			// one now to clean up the WAL.
+			performSnapshot = true
 			return nil
 		case *walpb.Entry_Snapshot_:
 			return nil
@@ -704,25 +898,38 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 		return err
 	}
 
-	if lastTx >= snapshotTx {
-		db.tx.Store(lastTx)
-		db.highWatermark.Store(lastTx)
-	}
-	if lastTxn := db.tx.Load(); lastTxn != lastIndex {
-		level.Warn(db.logger).Log(
-			"msg", "WAL last index is != db last txn, won't be able to log records to WAL",
-			"wal_last_index", lastIndex,
-			"last_tx", lastTxn,
-		)
+	resetTxn := snapshotTx
+	if lastTx > resetTxn {
+		resetTxn = lastTx
 	}
 
+	db.mtx.Lock()
+	for _, table := range db.tables {
+		block := table.ActiveBlock()
+		block.uncompressedInsertsSize.Store(block.Index().LevelSize(index.L0))
+	}
+	db.mtx.Unlock()
+
+	db.resetToTxn(resetTxn, nil)
+	if performSnapshot && db.columnStore.snapshotTriggerSize != 0 {
+		level.Info(db.logger).Log(
+			"msg", "performing snapshot after recovery",
+		)
+		db.snapshot(ctx, false, func() {
+			if err := db.reclaimDiskSpace(ctx, wal); err != nil {
+				level.Error(db.logger).Log(
+					"msg", "failed to reclaim disk space after snapshot during recovery",
+					"err", err,
+				)
+			}
+		})
+	}
 	level.Info(db.logger).Log(
 		append(
 			[]any{
 				"msg", "db recovered",
-				"wal_first_index", firstIndex,
-				"wal_last_index", lastIndex,
 				"wal_replay_duration", time.Since(start),
+				"watermark", resetTxn,
 			},
 			snapshotLogArgs...,
 		)...,
@@ -730,44 +937,79 @@ func (db *DB) recover(ctx context.Context, wal WAL) error {
 	return nil
 }
 
-func (db *DB) Close() error {
-	for _, table := range db.tables {
-		table.close()
-		if db.bucket != nil {
-			// Write the blocks but no snapshots since they are long-running
-			// jobs.
-			table.writeBlock(table.ActiveBlock(), false /* snapshotDB */)
-		}
+type CloseOption func(*closeOptions)
+
+type closeOptions struct {
+	clearStorage bool
+}
+
+func WithClearStorage() CloseOption {
+	return func(o *closeOptions) {
+		o.clearStorage = true
+	}
+}
+
+func (db *DB) Close(options ...CloseOption) error {
+	opts := &closeOptions{}
+	for _, opt := range options {
+		opt(opts)
 	}
 
-	if db.bucket != nil {
-		// If we've successfully persisted all the table blocks we can remove
-		// the wal and snapshots.
-		if err := os.RemoveAll(db.snapshotsDir()); err != nil {
-			return err
-		}
-		if err := os.RemoveAll(db.walDir()); err != nil {
-			return err
+	shouldPersist := len(db.sinks) > 0 && !db.columnStore.manualBlockRotation
+	if !shouldPersist && db.columnStore.snapshotTriggerSize != 0 && !opts.clearStorage {
+		start := time.Now()
+		db.snapshot(context.Background(), false, func() {
+			level.Info(db.logger).Log("msg", "snapshot on close completed", "duration", time.Since(start))
+			if err := db.reclaimDiskSpace(context.Background(), nil); err != nil {
+				level.Error(db.logger).Log(
+					"msg", "failed to reclaim disk space after snapshot",
+					"err", err,
+				)
+			}
+		})
+	}
+
+	level.Info(db.logger).Log("msg", "closing DB")
+	for _, table := range db.tables {
+		table.close()
+		if shouldPersist {
+			// Write the blocks but no snapshots since they are long-running
+			// jobs. Use db.tx.Load as the block's max txn since the table was
+			// closed above, so no writes are in flight at this stage.
+			// TODO(asubiotto): Maybe we should snapshot in any case since it
+			// should be faster to write to local disk than upload to object
+			// storage. This would avoid a slow WAL replay on startup if we
+			// don't manage to persist in time.
+			table.writeBlock(table.ActiveBlock(), db.tx.Load(), false)
 		}
 	}
-	return db.closeInternal()
+	level.Info(db.logger).Log("msg", "closed all tables")
+
+	if err := db.closeInternal(); err != nil {
+		return err
+	}
+
+	if (shouldPersist || opts.clearStorage) && db.storagePath != "" {
+		if err := db.dropStorage(); err != nil {
+			return err
+		}
+		level.Info(db.logger).Log("msg", "cleaned up wal & snapshots")
+	}
+	return nil
 }
 
 func (db *DB) closeInternal() error {
-	if db.columnStore.enableWAL && db.wal != nil {
-		if err := db.wal.Close(); err != nil {
-			return err
+	defer func() {
+		// Clean up the txPool even on error.
+		if db.txPool != nil {
+			db.txPool.Stop()
 		}
-	}
-	if db.txPool != nil {
-		db.txPool.Stop()
-	}
+	}()
 
-	if db.compactorPool != nil {
-		db.compactorPool.stop()
+	if !db.columnStore.enableWAL || db.wal == nil {
+		return nil
 	}
-
-	return nil
+	return db.wal.Close()
 }
 
 func (db *DB) maintainWAL() {
@@ -776,6 +1018,34 @@ func (db *DB) maintainWAL() {
 			return
 		}
 	}
+}
+
+// reclaimDiskSpace attempts to read the latest valid snapshot txn and removes
+// any snapshots/wal entries that are older than the snapshot tx. Since this can
+// be called before db.wal is set, the caller may optionally pass in a WAL to
+// truncate.
+func (db *DB) reclaimDiskSpace(ctx context.Context, wal WAL) error {
+	if db.columnStore.testingOptions.disableReclaimDiskSpaceOnSnapshot {
+		return nil
+	}
+	validSnapshotTxn, err := db.getLatestValidSnapshotTxn(ctx)
+	if err != nil {
+		return err
+	}
+	if validSnapshotTxn == 0 {
+		return nil
+	}
+	if err := db.cleanupSnapshotDir(ctx, validSnapshotTxn); err != nil {
+		return err
+	}
+	if wal == nil {
+		wal = db.wal
+	}
+	// Snapshots are taken with a read txn and are inclusive, so therefore
+	// include a potential write at validSnapshotTxn. We don't want this to be
+	// the first entry in the WAL after truncation, given it is already
+	// contained in the snapshot, so Truncate at validSnapshotTxn + 1.
+	return wal.Truncate(validSnapshotTxn + 1)
 }
 
 func (db *DB) getMinTXPersisted() uint64 {
@@ -803,7 +1073,7 @@ func (db *DB) readOnlyTable(name string) (*Table, error) {
 		db,
 		name,
 		nil,
-		db.reg,
+		db.metricsProvider.metricsForTable(name),
 		db.logger,
 		db.tracer,
 		db.wal,
@@ -816,7 +1086,34 @@ func (db *DB) readOnlyTable(name string) (*Table, error) {
 	return table, nil
 }
 
+// promoteReadOnlyTableLocked promotes a read-only table to a read-write table.
+// The read-write table is returned but not added to the database. Callers must
+// do so.
+// db.mtx must be held while calling this method.
+func (db *DB) promoteReadOnlyTableLocked(name string, config *tablepb.TableConfig) (*Table, error) {
+	table, ok := db.roTables[name]
+	if !ok {
+		return nil, fmt.Errorf("read only table %s not found", name)
+	}
+	schema, err := schemaFromTableConfig(config)
+	if err != nil {
+		return nil, err
+	}
+	table.config.Store(config)
+	table.schema = schema
+	delete(db.roTables, name)
+	return table, nil
+}
+
+// Table will get or create a new table with the given name and config. If a table already exists with the given name, it will have it's configuration updated.
 func (db *DB) Table(name string, config *tablepb.TableConfig) (*Table, error) {
+	return db.table(name, config, generateULID())
+}
+
+func (db *DB) table(name string, config *tablepb.TableConfig, id ulid.ULID) (*Table, error) {
+	if config == nil {
+		return nil, fmt.Errorf("table config cannot be nil")
+	}
 	if !validateName(name) {
 		return nil, errors.New("invalid table name")
 	}
@@ -824,6 +1121,7 @@ func (db *DB) Table(name string, config *tablepb.TableConfig) (*Table, error) {
 	table, ok := db.tables[name]
 	db.mtx.RUnlock()
 	if ok {
+		table.config.Store(config)
 		return table, nil
 	}
 
@@ -838,22 +1136,19 @@ func (db *DB) Table(name string, config *tablepb.TableConfig) (*Table, error) {
 	}
 
 	// Check if this table exists as a read only table
-	table, ok = db.roTables[name]
-	if ok {
+	if _, ok := db.roTables[name]; ok {
 		var err error
-		table.config = config
-		table.schema, err = schemaFromTableConfig(config)
+		table, err = db.promoteReadOnlyTableLocked(name, config)
 		if err != nil {
 			return nil, err
 		}
-		delete(db.roTables, name)
 	} else {
 		var err error
 		table, err = newTable(
 			db,
 			name,
 			config,
-			db.reg,
+			db.metricsProvider.metricsForTable(name),
 			db.logger,
 			db.tracer,
 			db.wal,
@@ -866,7 +1161,6 @@ func (db *DB) Table(name string, config *tablepb.TableConfig) (*Table, error) {
 	tx, _, commit := db.begin()
 	defer commit()
 
-	id := generateULID()
 	if err := table.newTableBlock(0, tx, id); err != nil {
 		return nil, err
 	}
@@ -895,6 +1189,14 @@ func (db *DB) GetTable(name string) (*Table, error) {
 
 func (db *DB) TableProvider() *DBTableProvider {
 	return NewDBTableProvider(db)
+}
+
+// TableNames returns the names of all the db's tables.
+func (db *DB) TableNames() []string {
+	db.mtx.RLock()
+	tables := maps.Keys(db.tables)
+	db.mtx.RUnlock()
+	return tables
 }
 
 type DBTableProvider struct {
@@ -935,15 +1237,18 @@ func (db *DB) beginRead() uint64 {
 //	The current high watermark
 //	A function to complete the transaction
 func (db *DB) begin() (uint64, uint64, func()) {
-	tx := db.tx.Add(1)
+	txn := db.tx.Add(1)
 	watermark := db.highWatermark.Load()
-	return tx, watermark, func() {
-		if mark := db.highWatermark.Load(); mark+1 == tx { // This is the next consecutive transaction; increate the watermark
-			db.highWatermark.Add(1)
+	return txn, watermark, func() {
+		if mark := db.highWatermark.Load(); mark+1 == txn {
+			// This is the next consecutive transaction; increase the watermark.
+			db.highWatermark.Store(txn)
+			db.txPool.notifyWatermark()
+			return
 		}
 
 		// place completed transaction in the waiting pool
-		db.txPool.Insert(tx)
+		db.txPool.Insert(txn)
 	}
 }
 
@@ -958,7 +1263,81 @@ func (db *DB) Wait(tx uint64) {
 	}
 }
 
+// HighWatermark returns the current high watermark.
+func (db *DB) HighWatermark() uint64 {
+	return db.highWatermark.Load()
+}
+
+// resetToTxn resets the DB's internal state to resume from the given
+// transaction. If the given wal is non-nil, it is also reset so that the next
+// expected transaction will log correctly to the WAL. Note that db.wal is not
+// used since callers might be calling resetToTxn before db.wal has been
+// initialized or might not want the WAL to be reset.
+func (db *DB) resetToTxn(txn uint64, wal WAL) {
+	db.tx.Store(txn)
+	db.highWatermark.Store(txn)
+	if wal != nil {
+		// This call resets the WAL to a zero state so that new records can be
+		// logged.
+		if err := wal.Reset(txn + 1); err != nil {
+			level.Warn(db.logger).Log(
+				"msg", "failed to reset WAL when resetting DB to txn",
+				"txnID", txn,
+				"err", err,
+			)
+		}
+	}
+}
+
 // validateName ensures that the passed in name doesn't violate any constrainsts.
 func validateName(name string) bool {
 	return !strings.Contains(name, "/")
+}
+
+// dropStorage removes all data from the storage directory, but leaves the empty
+// storage directory.
+func (db *DB) dropStorage() error {
+	trashDir := db.trashDir()
+
+	entries, err := os.ReadDir(db.storagePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Nothing to drop.
+			return nil
+		}
+		return err
+	}
+	// Try to rename all entries as this is O(1) per entry. We want to preserve
+	// the storagePath for future opens of this database. Callers that want to
+	// drop the DB remove storagePath themselves.
+	if moveErr := func() error {
+		if err := os.MkdirAll(trashDir, os.FileMode(0o755)); err != nil {
+			return fmt.Errorf("making trash dir: %w", err)
+		}
+		// Create a temporary directory in the trash dir to avoid clashing
+		// with other wal/snapshot dirs that might not have been removed
+		// previously.
+		tmpPath, err := os.MkdirTemp(trashDir, "")
+		if err != nil {
+			return err
+		}
+		errs := make([]error, 0, len(entries))
+		for _, e := range entries {
+			if err := os.Rename(filepath.Join(db.storagePath, e.Name()), filepath.Join(tmpPath, e.Name())); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}(); moveErr != nil {
+		// If we failed to move storage path entries to the trash dir, fall back
+		// to attempting to remove them with RemoveAll.
+		errs := make([]error, 0, len(entries))
+		for _, e := range entries {
+			if err := os.RemoveAll(filepath.Join(db.storagePath, e.Name())); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		return errors.Join(errs...)
+	}
+	return os.RemoveAll(trashDir)
 }

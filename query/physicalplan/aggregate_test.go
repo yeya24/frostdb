@@ -3,14 +3,16 @@ package physicalplan
 import (
 	"context"
 	"encoding/binary"
+	"hash/maphash"
 	"math/rand"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/query/logicalplan"
 )
@@ -32,7 +34,7 @@ func Test_Aggregate_ArrayOverflow(t *testing.T) {
 
 	agg := NewHashAggregate(
 		allocator,
-		trace.NewNoopTracerProvider().Tracer(""),
+		noop.NewTracerProvider().Tracer(""),
 		[]Aggregation{
 			{
 				expr:       logicalplan.Col("value"),
@@ -44,13 +46,14 @@ func Test_Aggregate_ArrayOverflow(t *testing.T) {
 			logicalplan.Col("stacktrace"),
 			logicalplan.Col("id"),
 		},
+		maphash.MakeSeed(),
 		false,
 	)
 
 	totalRows := int64(0)
 	agg.SetNext(&OutputPlan{
-		callback: func(ctx context.Context, r arrow.Record) error {
-			require.Equal(t, 3, len(r.Schema().Fields()))
+		callback: func(_ context.Context, r arrow.Record) error {
+			require.Equal(t, 5, len(r.Schema().Fields()))
 			for i := 0; i < int(r.NumCols()); i++ {
 				require.Equal(t, r.NumRows(), int64(r.Column(i).Len()))
 			}

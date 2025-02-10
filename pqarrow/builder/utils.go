@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 )
 
 func NewBuilder(mem memory.Allocator, t arrow.DataType) ColumnBuilder {
@@ -34,6 +34,7 @@ func RollbackPrevious(cb ColumnBuilder) error {
 		b.ResetToLength(b.Len() - 1)
 	case *array.Int64Builder:
 		b.Resize(b.Len() - 1)
+
 	case *array.StringBuilder:
 		b.Resize(b.Len() - 1)
 	case *array.BinaryBuilder:
@@ -65,6 +66,12 @@ func AppendValue(cb ColumnBuilder, arr arrow.Array, i int) error {
 		b.AppendSingle(arr.(*array.Boolean).Value(i))
 	case *array.Int64Builder:
 		b.Append(arr.(*array.Int64).Value(i))
+	case *array.Int32Builder:
+		b.Append(arr.(*array.Int32).Value(i))
+	case *array.Float64Builder:
+		b.Append(arr.(*array.Float64).Value(i))
+	case *array.Uint64Builder:
+		b.Append(arr.(*array.Uint64).Value(i))
 	case *array.StringBuilder:
 		b.Append(arr.(*array.String).Value(i))
 	case *array.BinaryBuilder:
@@ -91,29 +98,44 @@ func AppendValue(cb ColumnBuilder, arr arrow.Array, i int) error {
 		default:
 			return fmt.Errorf("non-dictionary array %T provided for dictionary builder", a)
 		}
-	// case *array.List:
-	//	// TODO: This seems horribly inefficient, we already have the whole
-	//	// array and are just doing an expensive copy, but arrow doesn't seem
-	//	// to be able to append whole list scalars at once.
-	//	length := s.Value.Len()
-	//	larr := arr.(*array.ListBuilder)
-	//	vb := larr.ValueBuilder()
-	//	larr.Append(true)
-	//	for i := 0; i < length; i++ {
-	//		v, err := scalar.GetScalar(s.Value, i)
-	//		if err != nil {
-	//			return err
-	//		}
-
-	//		err = appendValue(vb, v)
-	//		if err != nil {
-	//			return err
-	//		}
-	//	}
-	//	return nil
+	case *array.ListBuilder:
+		return buildList(b.ValueBuilder(), b, arr, i)
+	case *ListBuilder:
+		return buildList(b.ValueBuilder(), b, arr, i)
 	default:
 		return fmt.Errorf("unsupported type for arrow append %T", b)
 	}
+	return nil
+}
+
+type ListLikeBuilder interface {
+	Append(bool)
+}
+
+func buildList(vb any, b ListLikeBuilder, arr arrow.Array, i int) error {
+	list := arr.(*array.List)
+	start, end := list.ValueOffsets(i)
+	values := array.NewSlice(list.ListValues(), start, end)
+	defer values.Release()
+
+	switch v := values.(type) {
+	case *array.Dictionary:
+		switch dict := v.Dictionary().(type) {
+		case *array.Binary:
+			b.Append(true)
+			for j := 0; j < v.Len(); j++ {
+				switch bldr := vb.(type) {
+				case *array.BinaryDictionaryBuilder:
+					if err := bldr.Append(dict.Value(v.GetValueIndex(j))); err != nil {
+						return err
+					}
+				default:
+					return fmt.Errorf("uknown value builder type %T", bldr)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -151,12 +173,18 @@ func AppendGoValue(cb ColumnBuilder, v any) error {
 	switch b := cb.(type) {
 	case *OptBinaryBuilder:
 		return b.Append(v.([]byte))
-	case *OptInt64Builder:
-		b.Append(v.(int64))
 	case *OptBooleanBuilder:
 		b.AppendSingle(v.(bool))
+	case *OptFloat64Builder:
+		b.Append(v.(float64))
+	case *OptInt32Builder:
+		b.Append(v.(int32))
+	case *OptInt64Builder:
+		b.Append(v.(int64))
 	case *array.Int64Builder:
 		b.Append(v.(int64))
+	case *array.Int32Builder:
+		b.Append(v.(int32))
 	case *array.StringBuilder:
 		b.Append(v.(string))
 	case *array.BinaryBuilder:
@@ -166,8 +194,13 @@ func AppendGoValue(cb ColumnBuilder, v any) error {
 	case *array.BooleanBuilder:
 		b.Append(v.(bool))
 	case *array.BinaryDictionaryBuilder:
-		if err := b.Append(v.([]byte)); err != nil {
-			return err
+		switch e := v.(type) {
+		case string:
+			return b.Append([]byte(e))
+		case []byte:
+			return b.Append(e)
+		default:
+			return fmt.Errorf("unsupported type %T for append go value %T", e, b)
 		}
 	default:
 		return fmt.Errorf("unsupported type for append go value %T", b)

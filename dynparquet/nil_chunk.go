@@ -3,8 +3,8 @@ package dynparquet
 import (
 	"io"
 
-	"github.com/segmentio/parquet-go"
-	"github.com/segmentio/parquet-go/encoding"
+	"github.com/parquet-go/parquet-go"
+	"github.com/parquet-go/parquet-go/encoding"
 )
 
 // NilColumnChunk is a column chunk that contains a single page with all null
@@ -136,7 +136,7 @@ func (p *nilPage) NumNulls() int64 {
 
 // Bounds returns the minimum and maximum values of the page, since all values
 // in the page are null, both the minimum and maximum values are null.
-func (p *nilPage) Bounds() (min, max parquet.Value, ok bool) {
+func (p *nilPage) Bounds() (_, _ parquet.Value, _ bool) {
 	return parquet.ValueOf(nil).Level(0, 0, p.columnIndex), parquet.ValueOf(nil).Level(0, 0, p.columnIndex), true
 }
 
@@ -167,14 +167,6 @@ type nilValueReader struct {
 	numValues int
 	idx       int
 	read      int
-}
-
-// min determines the minimum of two integers and returns the minimum.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ReadValues reads the next n values from the page and returns the amount of
@@ -217,7 +209,7 @@ func (p *nilPage) Data() encoding.Values {
 	panic("not implemented")
 }
 
-func (p *nilPage) Slice(i, j int64) parquet.Page {
+func (p *nilPage) Slice(_, _ int64) parquet.Page {
 	return &nilPage{
 		numValues:   p.numValues,
 		columnIndex: p.columnIndex,
@@ -243,15 +235,15 @@ func (p *nilPages) SeekToRow(row int64) error {
 // ColumnIndex returns the column index of the column chunk. Since the
 // NilColumnChunk is a virtual column chunk only for in-memory purposes, it
 // returns nil. Implements the parquet.ColumnChunk interface.
-func (c *NilColumnChunk) ColumnIndex() parquet.ColumnIndex {
-	return nil
+func (c *NilColumnChunk) ColumnIndex() (parquet.ColumnIndex, error) {
+	return nil, nil
 }
 
 // OffsetIndex returns the offset index of the column chunk. Since the
 // NilColumnChunk is a virtual column chunk only for in-memory purposes, it
 // returns nil. Implements the parquet.ColumnChunk interface.
-func (c *NilColumnChunk) OffsetIndex() parquet.OffsetIndex {
-	return nil
+func (c *NilColumnChunk) OffsetIndex() (parquet.OffsetIndex, error) {
+	return nil, nil
 }
 
 // BloomFilter returns the bloomfilter of the column chunk. Since the

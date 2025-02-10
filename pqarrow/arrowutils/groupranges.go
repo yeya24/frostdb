@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
 )
 
 // GetGroupsAndOrderedSetRanges returns a min-heap of group ranges and ordered
@@ -68,10 +68,7 @@ func GetGroupsAndOrderedSetRanges(
 			}
 
 			// And update the current group.
-			v, err := GetValue(t, j)
-			if err != nil {
-				return err
-			}
+			v := t.GetOneForMarshal(j)
 			switch concreteV := v.(type) {
 			case []byte:
 				// Safe copy, otherwise the value might get overwritten.
@@ -178,6 +175,26 @@ func GetGroupsAndOrderedSetRanges(
 						return nil, nil, nil, err
 					}
 				}
+
+			case *array.String:
+				for j := 0; j < arr.Len(); j++ {
+					var curGroupValue *string
+					if curGroup[i] != nil {
+						g := curGroup[i].(string)
+						curGroupValue = &g
+					}
+					vIsNull := t.IsNull(j)
+					cmp, ok := nullComparison(curGroupValue == nil, vIsNull)
+					if !ok {
+						cmp = strings.Compare(*curGroupValue,
+							dict.Value(t.GetValueIndex(j)),
+						)
+					}
+					if err := handleCmpResult(cmp, i, t, j); err != nil {
+						return nil, nil, nil, err
+					}
+				}
+
 			default:
 				panic(fmt.Sprintf("unsupported dictionary type: %T", dict))
 			}
@@ -195,7 +212,7 @@ func GetGroupsAndOrderedSetRanges(
 // If the returned boolean is false, the comparison should be disregarded.
 func nullComparison(leftNull, rightNull bool) (int, bool) {
 	if !leftNull && !rightNull {
-		// Both are null, this implies that the null comparison should be
+		// Both are not null, this implies that the null comparison should be
 		// disregarded.
 		return 0, false
 	}

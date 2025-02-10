@@ -5,25 +5,36 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/go-kit/log/level"
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/polarsignals/iceberg-go"
+	"github.com/polarsignals/iceberg-go/catalog"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
-	"github.com/thanos-io/objstore/providers/filesystem"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/protobuf/proto"
 
 	"github.com/polarsignals/frostdb/dynparquet"
-	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
-	"github.com/polarsignals/frostdb/pqarrow"
+	walpb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/wal/v1alpha1"
+	"github.com/polarsignals/frostdb/index"
 	"github.com/polarsignals/frostdb/query"
 	"github.com/polarsignals/frostdb/query/logicalplan"
+	"github.com/polarsignals/frostdb/query/physicalplan"
+	"github.com/polarsignals/frostdb/recovery"
+	"github.com/polarsignals/frostdb/storage"
 )
 
 func TestDBWithWALAndBucket(t *testing.T) {
@@ -34,15 +45,16 @@ func TestDBWithWALAndBucket(t *testing.T) {
 	logger := newTestLogger(t)
 
 	dir := t.TempDir()
-	bucket, err := filesystem.NewBucket(dir)
-	require.NoError(t, err)
+	bucket := objstore.NewInMemBucket()
+
+	sinksource := NewDefaultObjstoreBucket(bucket)
 
 	c, err := New(
 		WithLogger(logger),
 		WithWAL(),
 		WithStoragePath(dir),
-		WithBucketStorage(bucket),
-		WithActiveMemorySize(100*1024),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*KiB),
 	)
 	require.NoError(t, err)
 	db, err := c.DB(context.Background(), "test")
@@ -54,9 +66,9 @@ func TestDBWithWALAndBucket(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 100; i++ {
-		buf, err := samples.ToBuffer(table.Schema())
+		r, err := samples.ToRecord()
 		require.NoError(t, err)
-		_, err = table.InsertBuffer(ctx, buf)
+		_, err = table.InsertRecord(ctx, r)
 		require.NoError(t, err)
 	}
 	require.NoError(t, table.EnsureCompaction())
@@ -66,226 +78,194 @@ func TestDBWithWALAndBucket(t *testing.T) {
 		WithLogger(logger),
 		WithWAL(),
 		WithStoragePath(dir),
-		WithBucketStorage(bucket),
-		WithActiveMemorySize(100*1024),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*KiB),
 	)
 	require.NoError(t, err)
 	defer c.Close()
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err = db.Table("test", config)
+	require.NoError(t, err)
+
+	// Validate that a read can be performed of the persisted data
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	rows := int64(0)
+	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
+		return table.Iterator(
+			ctx,
+			tx,
+			pool,
+			[]logicalplan.Callback{func(_ context.Context, ar arrow.Record) error {
+				rows += ar.NumRows()
+				return nil
+			}},
+		)
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(300), rows)
 }
 
 func TestDBWithWAL(t *testing.T) {
 	ctx := context.Background()
-	test := func(t *testing.T, isArrow bool) {
-		config := NewTableConfig(
-			dynparquet.SampleDefinition(),
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+
+	dir := t.TempDir()
+	c, err := New(
+		WithLogger(logger),
+		WithWAL(),
+		WithStoragePath(dir),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.Samples{{
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 1,
+		Value:     1,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 2,
+		Value:     2,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 3,
+		Value:     3,
+	}}
+
+	rec, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	_, err = table.InsertRecord(ctx, rec)
+	require.NoError(t, err)
+
+	samples = dynparquet.Samples{{
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 2,
+		Value:     2,
+	}}
+
+	rec, err = samples.ToRecord()
+	require.NoError(t, err)
+
+	_, err = table.InsertRecord(ctx, rec)
+	require.NoError(t, err)
+
+	samples = dynparquet.Samples{{
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+			"label3": "value3",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 3,
+		Value:     3,
+	}}
+
+	rec, err = samples.ToRecord()
+	require.NoError(t, err)
+
+	_, err = table.InsertRecord(ctx, rec)
+	require.NoError(t, err)
+
+	require.NoError(t, c.Close())
+
+	c, err = New(
+		WithLogger(logger),
+		WithWAL(),
+		WithStoragePath(dir),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err = db.Table("test", config)
+	require.NoError(t, err)
+
+	pool := memory.NewGoAllocator()
+	records := []arrow.Record{}
+	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
+		return table.Iterator(
+			ctx,
+			tx,
+			pool,
+			[]logicalplan.Callback{func(_ context.Context, ar arrow.Record) error {
+				ar.Retain()
+				records = append(records, ar)
+				return nil
+			}},
 		)
+	})
+	require.NoError(t, err)
 
-		logger := newTestLogger(t)
-
-		dir := t.TempDir()
-		c, err := New(
-			WithLogger(logger),
-			WithWAL(),
-			WithStoragePath(dir),
-		)
-		require.NoError(t, err)
-		defer c.Close()
-
-		db, err := c.DB(context.Background(), "test")
-		require.NoError(t, err)
-		table, err := db.Table("test", config)
-		require.NoError(t, err)
-
-		samples := dynparquet.Samples{{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
-			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-			},
-			Timestamp: 1,
-			Value:     1,
-		}, {
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value2"},
-				{Name: "label2", Value: "value2"},
-				{Name: "label3", Value: "value3"},
-			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-			},
-			Timestamp: 2,
-			Value:     2,
-		}, {
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value3"},
-				{Name: "label2", Value: "value2"},
-				{Name: "label4", Value: "value4"},
-			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-			},
-			Timestamp: 3,
-			Value:     3,
-		}}
-
-		switch isArrow {
-		case true:
-
-			ps, err := table.Schema().DynamicParquetSchema(map[string][]string{
-				"labels": {"label1", "label2", "label3", "label4"},
-			})
-			require.NoError(t, err)
-
-			sc, err := pqarrow.ParquetSchemaToArrowSchema(ctx, ps, logicalplan.IterOptions{})
-			require.NoError(t, err)
-
-			rec, err := samples.ToRecord(sc)
-			require.NoError(t, err)
-
-			ctx := context.Background()
-			_, err = table.InsertRecord(ctx, rec)
-			require.NoError(t, err)
-
-		default:
-			buf, err := samples.ToBuffer(table.Schema())
-			require.NoError(t, err)
-
-			ctx := context.Background()
-			_, err = table.InsertBuffer(ctx, buf)
-			require.NoError(t, err)
-		}
-
-		samples = dynparquet.Samples{{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
-			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-			},
-			Timestamp: 2,
-			Value:     2,
-		}}
-
-		switch isArrow {
-		case true:
-			ps, err := table.Schema().DynamicParquetSchema(map[string][]string{
-				"labels": {"label1", "label2"},
-			})
-			require.NoError(t, err)
-
-			sc, err := pqarrow.ParquetSchemaToArrowSchema(ctx, ps, logicalplan.IterOptions{})
-			require.NoError(t, err)
-
-			rec, err := samples.ToRecord(sc)
-			require.NoError(t, err)
-
-			ctx := context.Background()
-			_, err = table.InsertRecord(ctx, rec)
-			require.NoError(t, err)
-		default:
-			buf, err := samples.ToBuffer(table.Schema())
-			require.NoError(t, err)
-
-			_, err = table.InsertBuffer(ctx, buf)
-			require.NoError(t, err)
-		}
-
-		samples = dynparquet.Samples{{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
-				{Name: "label3", Value: "value3"},
-			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-			},
-			Timestamp: 3,
-			Value:     3,
-		}}
-
-		switch isArrow {
-		case true:
-			ps, err := table.Schema().DynamicParquetSchema(map[string][]string{
-				"labels": {"label1", "label2", "label3"},
-			})
-			require.NoError(t, err)
-
-			sc, err := pqarrow.ParquetSchemaToArrowSchema(ctx, ps, logicalplan.IterOptions{})
-			require.NoError(t, err)
-
-			rec, err := samples.ToRecord(sc)
-			require.NoError(t, err)
-
-			ctx := context.Background()
-			_, err = table.InsertRecord(ctx, rec)
-			require.NoError(t, err)
-		default:
-			buf, err := samples.ToBuffer(table.Schema())
-			require.NoError(t, err)
-
-			_, err = table.InsertBuffer(ctx, buf)
-			require.NoError(t, err)
-		}
-
-		require.NoError(t, c.Close())
-
-		c, err = New(
-			WithLogger(logger),
-			WithWAL(),
-			WithStoragePath(dir),
-		)
-		require.NoError(t, err)
-		defer c.Close()
-
-		db, err = c.DB(context.Background(), "test")
-		require.NoError(t, err)
-		table, err = db.Table("test", config)
-		require.NoError(t, err)
-
-		pool := memory.NewGoAllocator()
-		records := []arrow.Record{}
-		err = table.View(ctx, func(ctx context.Context, tx uint64) error {
-			return table.Iterator(
-				ctx,
-				tx,
-				pool,
-				[]logicalplan.Callback{func(ctx context.Context, ar arrow.Record) error {
-					ar.Retain()
-					records = append(records, ar)
-					return nil
-				}},
-			)
-		})
-		require.NoError(t, err)
-
-		// Validate returned data
-		rows := int64(0)
-		for _, r := range records {
-			rows += r.NumRows()
-			r.Release()
-		}
-		require.Equal(t, int64(5), rows)
+	// Validate returned data
+	rows := int64(0)
+	for _, r := range records {
+		rows += r.NumRows()
+		r.Release()
 	}
+	require.Equal(t, int64(5), rows)
 
-	t.Run("parquet", func(t *testing.T) {
-		test(t, false)
-	})
-	t.Run("arrow", func(t *testing.T) {
-		test(t, true)
-	})
+	// Perform an aggregate query against the replayed data
+	engine := query.NewEngine(pool, db.TableProvider())
+	err = engine.ScanTable("test").
+		Aggregate(
+			[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
+			[]logicalplan.Expr{logicalplan.Col("labels.label2")},
+		).
+		Execute(context.Background(), func(_ context.Context, _ arrow.Record) error {
+			return nil
+		})
+	require.NoError(t, err)
 }
 
 func Test_DB_WithStorage(t *testing.T) {
@@ -293,14 +273,13 @@ func Test_DB_WithStorage(t *testing.T) {
 		dynparquet.SampleDefinition(),
 	)
 
-	bucket, err := filesystem.NewBucket(t.TempDir())
-	require.NoError(t, err)
-
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
 	logger := newTestLogger(t)
 
 	c, err := New(
 		WithLogger(logger),
-		WithBucketStorage(bucket),
+		WithReadWriteStorage(sinksource),
 	)
 	require.NoError(t, err)
 
@@ -312,9 +291,9 @@ func Test_DB_WithStorage(t *testing.T) {
 
 	samples := dynparquet.Samples{{
 		ExampleType: "test",
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -324,10 +303,10 @@ func Test_DB_WithStorage(t *testing.T) {
 		Value:     1,
 	}, {
 		ExampleType: "test",
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value2"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -337,10 +316,10 @@ func Test_DB_WithStorage(t *testing.T) {
 		Value:     2,
 	}, {
 		ExampleType: "test",
-		Labels: []dynparquet.Label{
-			{Name: "label1", Value: "value3"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label4", Value: "value4"},
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -350,294 +329,55 @@ func Test_DB_WithStorage(t *testing.T) {
 		Value:     3,
 	}}
 
-	buf, err := samples.ToBuffer(table.Schema())
+	r, err := samples.ToRecord()
 	require.NoError(t, err)
 
 	ctx := context.Background()
-	_, err = table.InsertBuffer(ctx, buf)
+	_, err = table.InsertRecord(ctx, r)
 	require.NoError(t, err)
-
-	// Gracefully close the db to persist blocks
-	c.Close()
 
 	pool := memory.NewGoAllocator()
 	engine := query.NewEngine(pool, db.TableProvider())
+	var inMemory arrow.Record
 	err = engine.ScanTable(t.Name()).
 		Filter(logicalplan.Col("timestamp").GtEq(logicalplan.Literal(2))).
-		Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
-			require.Equal(t, int64(1), r.NumCols())
-			require.Equal(t, int64(2), r.NumRows())
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			r.Retain()
+			inMemory = r
 			return nil
 		})
-	require.NoError(t, err)
-}
-
-func Test_DB_ColdStart(t *testing.T) {
-	sanitize := func(name string) string {
-		return strings.Replace(name, "/", "-", -1)
-	}
-
-	config := NewTableConfig(
-		dynparquet.SampleDefinition(),
-	)
-
-	bucket, err := filesystem.NewBucket(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(sanitize(t.Name()))
-	})
-
-	logger := newTestLogger(t)
-
-	tests := map[string]struct {
-		newColumnstore func(t *testing.T) *ColumnStore
-	}{
-		"cold start with storage": {
-			newColumnstore: func(t *testing.T) *ColumnStore {
-				c, err := New(
-					WithLogger(logger),
-					WithBucketStorage(bucket),
-				)
-				require.NoError(t, err)
-				return c
-			},
-		},
-		"cold start with storage and wal": {
-			newColumnstore: func(t *testing.T) *ColumnStore {
-				c, err := New(
-					WithLogger(logger),
-					WithBucketStorage(bucket),
-					WithWAL(),
-					WithStoragePath(t.TempDir()),
-				)
-				require.NoError(t, err)
-				return c
-			},
-		},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			c := test.newColumnstore(t)
-			db, err := c.DB(context.Background(), sanitize(t.Name()))
-			require.NoError(t, err)
-			table, err := db.Table(sanitize(t.Name()), config)
-			require.NoError(t, err)
-			t.Cleanup(func() {
-				os.RemoveAll(sanitize(t.Name()))
-			})
-
-			samples := dynparquet.Samples{
-				{
-					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
-					},
-					Stacktrace: []uuid.UUID{
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-					},
-					Timestamp: 1,
-					Value:     1,
-				},
-				{
-					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
-					},
-					Stacktrace: []uuid.UUID{
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-					},
-					Timestamp: 2,
-					Value:     2,
-				},
-				{
-					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
-					},
-					Stacktrace: []uuid.UUID{
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
-					},
-					Timestamp: 3,
-					Value:     3,
-				},
-			}
-
-			buf, err := samples.ToBuffer(table.Schema())
-			require.NoError(t, err)
-
-			ctx := context.Background()
-			_, err = table.InsertBuffer(ctx, buf)
-			require.NoError(t, err)
-
-			// Gracefully close the db to persist blocks
-			c.Close()
-
-			// Open a new database pointed to the same bucket storage
-			c, err = New(
-				WithLogger(logger),
-				WithBucketStorage(bucket),
-			)
-			require.NoError(t, err)
-			defer c.Close()
-
-			// connect to our test db
-			db, err = c.DB(context.Background(), sanitize(t.Name()))
-			require.NoError(t, err)
-
-			pool := memory.NewGoAllocator()
-			engine := query.NewEngine(pool, db.TableProvider())
-			require.NoError(t, engine.ScanTable(sanitize(t.Name())).Execute(
-				context.Background(), func(ctx context.Context, r arrow.Record) error {
-					require.Equal(t, int64(6), r.NumCols())
-					require.Equal(t, int64(3), r.NumRows())
-					return nil
-				},
-			))
-		})
-	}
-}
-
-func Test_DB_ColdStart_MissingColumn(t *testing.T) {
-	schemaDef := &schemapb.Schema{
-		Name: "test",
-		Columns: []*schemapb.Column{
-			{
-				Name: "example_type",
-				StorageLayout: &schemapb.StorageLayout{
-					Type:     schemapb.StorageLayout_TYPE_STRING,
-					Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
-				},
-				Dynamic: false,
-			},
-			{
-				Name: "labels",
-				StorageLayout: &schemapb.StorageLayout{
-					Type:     schemapb.StorageLayout_TYPE_STRING,
-					Nullable: true,
-					Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
-				},
-				Dynamic: true,
-			},
-			{
-				Name: "pprof_labels",
-				StorageLayout: &schemapb.StorageLayout{
-					Type:     schemapb.StorageLayout_TYPE_STRING,
-					Nullable: true,
-					Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
-				},
-				Dynamic: true,
-			},
-		},
-		SortingColumns: []*schemapb.SortingColumn{
-			{
-				Name:      "example_type",
-				Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
-			},
-			{
-				Name:       "labels",
-				Direction:  schemapb.SortingColumn_DIRECTION_ASCENDING,
-				NullsFirst: true,
-			},
-			{
-				Name:       "pprof_labels",
-				Direction:  schemapb.SortingColumn_DIRECTION_ASCENDING,
-				NullsFirst: true,
-			},
-		},
-	}
-
-	config := NewTableConfig(schemaDef)
-
-	bucket, err := filesystem.NewBucket(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(t.Name())
-	})
-
-	logger := newTestLogger(t)
-
-	c, err := New(
-		WithLogger(logger),
-		WithBucketStorage(bucket),
-	)
-	require.NoError(t, err)
-
-	db, err := c.DB(context.Background(), t.Name())
-	require.NoError(t, err)
-	table, err := db.Table(t.Name(), config)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(t.Name())
-	})
-
-	buf, err := table.schema.NewBuffer(map[string][]string{
-		"labels": {
-			"label1",
-			"label2",
-		},
-		"pprof_labels": {},
-	})
-	require.NoError(t, err)
-
-	_, err = buf.WriteRows([]parquet.Row{
-		{
-			parquet.ValueOf("test").Level(0, 0, 0),
-			parquet.ValueOf("value1").Level(0, 1, 1),
-			parquet.ValueOf("value1").Level(0, 1, 2),
-		},
-	})
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	_, err = table.InsertBuffer(ctx, buf)
 	require.NoError(t, err)
 
 	// Gracefully close the db to persist blocks
 	c.Close()
 
-	// Open a new database pointed to the same bucket storage
 	c, err = New(
 		WithLogger(logger),
-		WithBucketStorage(bucket),
+		WithReadWriteStorage(sinksource),
 	)
 	require.NoError(t, err)
 	defer c.Close()
 
-	// connect to our test db
 	db, err = c.DB(context.Background(), t.Name())
 	require.NoError(t, err)
 
-	// fetch new table
-	table, err = db.Table(t.Name(), config)
+	_, err = db.Table(t.Name(), config)
 	require.NoError(t, err)
 
-	buf, err = table.schema.NewBuffer(map[string][]string{
-		"labels": {
-			"label1",
-			"label2",
-		},
-		"pprof_labels": {},
-	})
+	engine = query.NewEngine(pool, db.TableProvider())
+	var onDisk arrow.Record
+	err = engine.ScanTable(t.Name()).
+		Filter(logicalplan.Col("timestamp").GtEq(logicalplan.Literal(2))).
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			r.Retain()
+			onDisk = r
+			return nil
+		})
 	require.NoError(t, err)
 
-	_, err = buf.WriteRows([]parquet.Row{
-		{
-			parquet.ValueOf("test").Level(0, 0, 0),
-			parquet.ValueOf("value2").Level(0, 1, 1),
-			parquet.ValueOf("value2").Level(0, 1, 2),
-		},
-	})
-	require.NoError(t, err)
-
-	_, err = table.InsertBuffer(ctx, buf)
-	require.NoError(t, err)
+	require.True(t, array.RecordEqual(inMemory, onDisk))
+	require.Equal(t, int64(1), onDisk.NumCols())
+	require.Equal(t, int64(2), onDisk.NumRows())
 }
 
 func Test_DB_Filter_Block(t *testing.T) {
@@ -649,12 +389,8 @@ func Test_DB_Filter_Block(t *testing.T) {
 		dynparquet.SampleDefinition(),
 	)
 
-	bucket, err := filesystem.NewBucket(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(sanitize(t.Name()))
-	})
-
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
 	logger := newTestLogger(t)
 
 	tests := map[string]struct {
@@ -675,7 +411,7 @@ func Test_DB_Filter_Block(t *testing.T) {
 			newColumnstore: func(t *testing.T) *ColumnStore {
 				c, err := New(
 					WithLogger(logger),
-					WithBucketStorage(bucket),
+					WithReadWriteStorage(sinksource),
 				)
 				require.NoError(t, err)
 				return c
@@ -690,7 +426,7 @@ func Test_DB_Filter_Block(t *testing.T) {
 			newColumnstore: func(t *testing.T) *ColumnStore {
 				c, err := New(
 					WithLogger(logger),
-					WithBucketStorage(bucket),
+					WithReadWriteStorage(sinksource),
 				)
 				require.NoError(t, err)
 				return c
@@ -712,9 +448,9 @@ func Test_DB_Filter_Block(t *testing.T) {
 			samples := dynparquet.Samples{
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -725,9 +461,9 @@ func Test_DB_Filter_Block(t *testing.T) {
 				},
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -738,9 +474,9 @@ func Test_DB_Filter_Block(t *testing.T) {
 				},
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -751,11 +487,11 @@ func Test_DB_Filter_Block(t *testing.T) {
 				},
 			}
 
-			buf, err := samples.ToBuffer(table.Schema())
+			r, err := samples.ToRecord()
 			require.NoError(t, err)
 
 			ctx := context.Background()
-			_, err = table.InsertBuffer(ctx, buf)
+			_, err = table.InsertRecord(ctx, r)
 			require.NoError(t, err)
 
 			// Gracefully close the db to persist blocks
@@ -764,13 +500,16 @@ func Test_DB_Filter_Block(t *testing.T) {
 			// Open a new database pointed to the same bucket storage
 			c, err = New(
 				WithLogger(logger),
-				WithBucketStorage(bucket),
+				WithReadWriteStorage(sinksource),
 			)
 			require.NoError(t, err)
 			defer c.Close()
 
 			// connect to our test db
 			db, err = c.DB(context.Background(), sanitize(t.Name()))
+			require.NoError(t, err)
+
+			_, err = db.Table(sanitize(t.Name()), config)
 			require.NoError(t, err)
 
 			engine := query.NewEngine(
@@ -788,7 +527,7 @@ func Test_DB_Filter_Block(t *testing.T) {
 			if test.distinct != nil {
 				query = query.Distinct(test.distinct...)
 			}
-			err = query.Execute(context.Background(), func(ctx context.Context, ar arrow.Record) error {
+			err = query.Execute(context.Background(), func(_ context.Context, ar arrow.Record) error {
 				require.Equal(t, test.rows, ar.NumRows())
 				require.Equal(t, test.cols, ar.NumCols())
 				return nil
@@ -800,16 +539,21 @@ func Test_DB_Filter_Block(t *testing.T) {
 
 // ErrorBucket is an objstore.Bucket implementation that supports error injection.
 type ErrorBucket struct {
-	iter             func(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error
-	get              func(ctx context.Context, name string) (io.ReadCloser, error)
-	getRange         func(ctx context.Context, name string, off, length int64) (io.ReadCloser, error)
-	exists           func(ctx context.Context, name string) (bool, error)
-	isObjNotFoundErr func(err error) bool
-	attributes       func(ctx context.Context, name string) (objstore.ObjectAttributes, error)
+	iter                      func(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error
+	get                       func(ctx context.Context, name string) (io.ReadCloser, error)
+	getRange                  func(ctx context.Context, name string, off, length int64) (io.ReadCloser, error)
+	exists                    func(ctx context.Context, name string) (bool, error)
+	isObjNotFoundErr          func(err error) bool
+	isCustomerManagedKeyError func(err error) bool
+	attributes                func(ctx context.Context, name string) (objstore.ObjectAttributes, error)
 
 	upload func(ctx context.Context, name string, r io.Reader) error
 	delete func(ctx context.Context, name string) error
 	close  func() error
+}
+
+func (e *ErrorBucket) IsAccessDeniedErr(err error) bool {
+	return err != nil
 }
 
 func (e *ErrorBucket) Iter(ctx context.Context, dir string, f func(string) error, options ...objstore.IterOption) error {
@@ -847,6 +591,14 @@ func (e *ErrorBucket) Exists(ctx context.Context, name string) (bool, error) {
 func (e *ErrorBucket) IsObjNotFoundErr(err error) bool {
 	if e.isObjNotFoundErr != nil {
 		return e.isObjNotFoundErr(err)
+	}
+
+	return false
+}
+
+func (e *ErrorBucket) IsCustomerManagedKeyError(err error) bool {
+	if e.isCustomerManagedKeyError != nil {
+		return e.isCustomerManagedKeyError(err)
 	}
 
 	return false
@@ -900,10 +652,11 @@ func Test_DB_OpenError(t *testing.T) {
 			return nil
 		},
 	}
+	sinksource := NewDefaultObjstoreBucket(e)
 
 	c, err := New(
 		WithLogger(logger),
-		WithBucketStorage(e),
+		WithReadWriteStorage(sinksource),
 	)
 	require.NoError(t, err)
 	defer c.Close()
@@ -928,12 +681,8 @@ func Test_DB_Block_Optimization(t *testing.T) {
 		dynparquet.SampleDefinition(),
 	)
 
-	bucket, err := filesystem.NewBucket(t.TempDir())
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		os.RemoveAll(sanitize(t.Name()))
-	})
-
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
 	logger := newTestLogger(t)
 
 	now := time.Now()
@@ -955,7 +704,7 @@ func Test_DB_Block_Optimization(t *testing.T) {
 			newColumnstore: func(t *testing.T) *ColumnStore {
 				c, err := New(
 					WithLogger(logger),
-					WithBucketStorage(bucket),
+					WithReadWriteStorage(sinksource),
 				)
 				require.NoError(t, err)
 				return c
@@ -969,7 +718,7 @@ func Test_DB_Block_Optimization(t *testing.T) {
 			newColumnstore: func(t *testing.T) *ColumnStore {
 				c, err := New(
 					WithLogger(logger),
-					WithBucketStorage(bucket),
+					WithReadWriteStorage(sinksource),
 				)
 				require.NoError(t, err)
 				return c
@@ -991,9 +740,9 @@ func Test_DB_Block_Optimization(t *testing.T) {
 			samples := dynparquet.Samples{
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1004,9 +753,9 @@ func Test_DB_Block_Optimization(t *testing.T) {
 				},
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1017,9 +766,9 @@ func Test_DB_Block_Optimization(t *testing.T) {
 				},
 				{
 					ExampleType: "test",
-					Labels: []dynparquet.Label{
-						{Name: "label1", Value: "value1"},
-						{Name: "label2", Value: "value2"},
+					Labels: map[string]string{
+						"label1": "value1",
+						"label2": "value2",
 					},
 					Stacktrace: []uuid.UUID{
 						{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1030,11 +779,11 @@ func Test_DB_Block_Optimization(t *testing.T) {
 				},
 			}
 
-			buf, err := samples.ToBuffer(table.Schema())
+			r, err := samples.ToRecord()
 			require.NoError(t, err)
 
 			ctx := context.Background()
-			_, err = table.InsertBuffer(ctx, buf)
+			_, err = table.InsertRecord(ctx, r)
 			require.NoError(t, err)
 
 			// Gracefully close the db to persist blocks
@@ -1043,13 +792,16 @@ func Test_DB_Block_Optimization(t *testing.T) {
 			// Open a new database pointed to the same bucket storage
 			c, err = New(
 				WithLogger(logger),
-				WithBucketStorage(bucket),
+				WithReadWriteStorage(sinksource),
 			)
 			require.NoError(t, err)
 			defer c.Close()
 
 			// connect to our test db
 			db, err = c.DB(context.Background(), sanitize(t.Name()))
+			require.NoError(t, err)
+
+			_, err = db.Table(sanitize(t.Name()), config)
 			require.NoError(t, err)
 
 			engine := query.NewEngine(
@@ -1069,7 +821,7 @@ func Test_DB_Block_Optimization(t *testing.T) {
 			}
 			rows := int64(0)
 			cols := int64(0)
-			err = query.Execute(context.Background(), func(ctx context.Context, ar arrow.Record) error {
+			err = query.Execute(context.Background(), func(_ context.Context, ar arrow.Record) error {
 				rows += ar.NumRows()
 				cols += ar.NumCols()
 				return nil
@@ -1083,37 +835,12 @@ func Test_DB_Block_Optimization(t *testing.T) {
 
 func Test_DB_TableWrite_FlatSchema(t *testing.T) {
 	ctx := context.Background()
-	flatDefinition := &schemapb.Schema{
-		Name: "test",
-		Columns: []*schemapb.Column{{
-			Name: "example_type",
-			StorageLayout: &schemapb.StorageLayout{
-				Type:     schemapb.StorageLayout_TYPE_STRING,
-				Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
-			},
-			Dynamic: false,
-		}, {
-			Name: "timestamp",
-			StorageLayout: &schemapb.StorageLayout{
-				Type: schemapb.StorageLayout_TYPE_INT64,
-			},
-			Dynamic: false,
-		}, {
-			Name: "value",
-			StorageLayout: &schemapb.StorageLayout{
-				Type: schemapb.StorageLayout_TYPE_INT64,
-			},
-			Dynamic: false,
-		}},
-		SortingColumns: []*schemapb.SortingColumn{{
-			Name:      "example_type",
-			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
-		}, {
-			Name:      "timestamp",
-			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
-		}},
+
+	type Flat struct {
+		ExampleType string `frostdb:",rle_dict,asc(0)"`
+		Timestamp   int64  `frostdb:",asc(1)"`
+		Value       int64
 	}
-	config := NewTableConfig(flatDefinition)
 
 	c, err := New(WithLogger(newTestLogger(t)))
 	require.NoError(t, err)
@@ -1122,20 +849,15 @@ func Test_DB_TableWrite_FlatSchema(t *testing.T) {
 	db, err := c.DB(ctx, "flatschema")
 	require.NoError(t, err)
 
-	table, err := db.Table("test", config)
+	table, err := NewGenericTable[Flat](db, "test", memory.NewGoAllocator())
 	require.NoError(t, err)
+	defer table.Release()
 
-	s := struct {
-		ExampleType string
-		Timestamp   int64
-		Value       int64
-	}{
+	_, err = table.Write(ctx, Flat{
 		ExampleType: "hello-world",
 		Timestamp:   7,
 		Value:       8,
-	}
-
-	_, err = table.Write(ctx, s)
+	})
 	require.NoError(t, err)
 
 	engine := query.NewEngine(
@@ -1143,7 +865,7 @@ func Test_DB_TableWrite_FlatSchema(t *testing.T) {
 		db.TableProvider(),
 	)
 
-	err = engine.ScanTable("test").Execute(ctx, func(ctx context.Context, ar arrow.Record) error {
+	err = engine.ScanTable("test").Execute(ctx, func(_ context.Context, ar arrow.Record) error {
 		require.Equal(t, int64(1), ar.NumRows())
 		require.Equal(t, int64(3), ar.NumCols())
 		return nil
@@ -1153,9 +875,6 @@ func Test_DB_TableWrite_FlatSchema(t *testing.T) {
 
 func Test_DB_TableWrite_DynamicSchema(t *testing.T) {
 	ctx := context.Background()
-	config := NewTableConfig(
-		dynparquet.SampleDefinition(),
-	)
 
 	c, err := New(WithLogger(newTestLogger(t)))
 	require.NoError(t, err)
@@ -1164,17 +883,18 @@ func Test_DB_TableWrite_DynamicSchema(t *testing.T) {
 	db, err := c.DB(ctx, "sampleschema")
 	require.NoError(t, err)
 
-	table, err := db.Table("test", config)
+	table, err := NewGenericTable[dynparquet.Sample](db, "test", memory.NewGoAllocator())
 	require.NoError(t, err)
+	defer table.Release()
 
 	now := time.Now()
 	ts := now.UnixMilli()
 	samples := dynparquet.Samples{
 		{
 			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+			Labels: map[string]string{
+				"label1": "value1",
+				"label2": "value2",
 			},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1185,10 +905,10 @@ func Test_DB_TableWrite_DynamicSchema(t *testing.T) {
 		},
 		{
 			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
-				{Name: "label3", Value: "value3"},
+			Labels: map[string]string{
+				"label1": "value1",
+				"label2": "value2",
+				"label3": "value3",
 			},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1199,9 +919,9 @@ func Test_DB_TableWrite_DynamicSchema(t *testing.T) {
 		},
 		{
 			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+			Labels: map[string]string{
+				"label1": "value1",
+				"label2": "value2",
 			},
 			Stacktrace: []uuid.UUID{
 				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -1220,7 +940,7 @@ func Test_DB_TableWrite_DynamicSchema(t *testing.T) {
 		db.TableProvider(),
 	)
 
-	err = engine.ScanTable("test").Execute(ctx, func(ctx context.Context, ar arrow.Record) error {
+	err = engine.ScanTable("test").Execute(ctx, func(_ context.Context, ar arrow.Record) error {
 		require.Equal(t, int64(3), ar.NumRows())
 		require.Equal(t, int64(7), ar.NumCols())
 		return nil
@@ -1243,128 +963,125 @@ func Test_DB_TableNotExist(t *testing.T) {
 		db.TableProvider(),
 	)
 
-	err = engine.ScanTable("does-not-exist").Execute(ctx, func(ctx context.Context, ar arrow.Record) error {
+	err = engine.ScanTable("does-not-exist").Execute(ctx, func(_ context.Context, _ arrow.Record) error {
 		return nil
 	})
 	require.Error(t, err)
 }
 
 func Test_DB_TableWrite_ArrowRecord(t *testing.T) {
-	ctx := context.Background()
-	config := NewTableConfig(
+	for _, schema := range []proto.Message{
 		dynparquet.SampleDefinition(),
-	)
+		dynparquet.PrehashedSampleDefinition(),
+	} {
+		ctx := context.Background()
+		config := NewTableConfig(
+			schema,
+		)
 
-	c, err := New(WithLogger(newTestLogger(t)))
-	require.NoError(t, err)
-	defer c.Close()
+		c, err := New(WithLogger(newTestLogger(t)))
+		require.NoError(t, err)
+		defer c.Close()
 
-	db, err := c.DB(ctx, "sampleschema")
-	require.NoError(t, err)
+		db, err := c.DB(ctx, "sampleschema")
+		require.NoError(t, err)
 
-	table, err := db.Table("test", config)
-	require.NoError(t, err)
+		table, err := db.Table("test", config)
+		require.NoError(t, err)
 
-	samples := dynparquet.Samples{
-		{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+		samples := dynparquet.Samples{
+			{
+				ExampleType: "test",
+				Labels: map[string]string{
+					"label1": "value1",
+					"label2": "value2",
+				},
+				Stacktrace: []uuid.UUID{
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+				},
+				Timestamp: 10,
+				Value:     1,
 			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+			{
+				ExampleType: "test",
+				Labels: map[string]string{
+					"label1": "value1",
+					"label2": "value2",
+					"label3": "value3",
+				},
+				Stacktrace: []uuid.UUID{
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+				},
+				Timestamp: 11,
+				Value:     2,
 			},
-			Timestamp: 10,
-			Value:     1,
-		},
-		{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
-				{Name: "label3", Value: "value3"},
+			{
+				ExampleType: "test",
+				Labels: map[string]string{
+					"label1": "value1",
+					"label2": "value2",
+				},
+				Stacktrace: []uuid.UUID{
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+				},
+				Timestamp: 12,
+				Value:     3,
 			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		}
+
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+
+		engine := query.NewEngine(
+			memory.NewGoAllocator(),
+			db.TableProvider(),
+		)
+
+		tests := map[string]struct {
+			filter   logicalplan.Expr
+			distinct logicalplan.Expr
+			rows     int64
+			cols     int64
+		}{
+			"none": {
+				rows: 3,
+				cols: 7,
 			},
-			Timestamp: 11,
-			Value:     2,
-		},
-		{
-			ExampleType: "test",
-			Labels: []dynparquet.Label{
-				{Name: "label1", Value: "value1"},
-				{Name: "label2", Value: "value2"},
+			"timestamp filter": {
+				filter: logicalplan.Col("timestamp").GtEq(logicalplan.Literal(12)),
+				rows:   1,
+				cols:   1,
 			},
-			Stacktrace: []uuid.UUID{
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
-				{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+			"distinct": {
+				distinct: logicalplan.DynCol("labels"),
+				rows:     2,
+				cols:     3,
 			},
-			Timestamp: 12,
-			Value:     3,
-		},
-	}
+		}
 
-	ps, err := table.Schema().DynamicParquetSchema(map[string][]string{
-		"labels": {"label1", "label2", "label3"},
-	})
-	require.NoError(t, err)
-
-	sc, err := pqarrow.ParquetSchemaToArrowSchema(ctx, ps, logicalplan.IterOptions{})
-	require.NoError(t, err)
-
-	r, err := samples.ToRecord(sc)
-	require.NoError(t, err)
-
-	_, err = table.InsertRecord(ctx, r)
-	require.NoError(t, err)
-
-	engine := query.NewEngine(
-		memory.NewGoAllocator(),
-		db.TableProvider(),
-	)
-
-	tests := map[string]struct {
-		filter   logicalplan.Expr
-		distinct logicalplan.Expr
-		rows     int64
-		cols     int64
-	}{
-		"none": {
-			rows: 3,
-			cols: 7,
-		},
-		"timestamp filter": {
-			filter: logicalplan.Col("timestamp").GtEq(logicalplan.Literal(12)),
-			rows:   1,
-			cols:   7,
-		},
-		"distinct": {
-			distinct: logicalplan.DynCol("labels"),
-			rows:     2,
-			cols:     3,
-		},
-	}
-
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			bldr := engine.ScanTable("test")
-			if test.filter != nil {
-				bldr = bldr.Filter(test.filter)
-			}
-			if test.distinct != nil {
-				bldr = bldr.Distinct(test.distinct)
-			}
-			err = bldr.Execute(ctx, func(ctx context.Context, ar arrow.Record) error {
-				require.Equal(t, test.rows, ar.NumRows())
-				require.Equal(t, test.cols, ar.NumCols())
-				return nil
+		for name, test := range tests {
+			t.Run(name, func(t *testing.T) {
+				bldr := engine.ScanTable("test")
+				if test.filter != nil {
+					bldr = bldr.Filter(test.filter)
+				}
+				if test.distinct != nil {
+					bldr = bldr.Distinct(test.distinct)
+				}
+				err = bldr.Execute(ctx, func(_ context.Context, ar arrow.Record) error {
+					require.Equal(t, test.rows, ar.NumRows())
+					require.Equal(t, test.cols, ar.NumCols())
+					return nil
+				})
+				require.NoError(t, err)
 			})
-			require.NoError(t, err)
-		})
+		}
 	}
 }
 
@@ -1376,15 +1093,15 @@ func Test_DB_ReadOnlyQuery(t *testing.T) {
 	logger := newTestLogger(t)
 
 	dir := t.TempDir()
-	bucket, err := filesystem.NewBucket(dir)
-	require.NoError(t, err)
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
 
 	c, err := New(
 		WithLogger(logger),
 		WithWAL(),
 		WithStoragePath(dir),
-		WithBucketStorage(bucket),
-		WithActiveMemorySize(100*1024),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*KiB),
 	)
 	require.NoError(t, err)
 	db, err := c.DB(context.Background(), "test")
@@ -1396,9 +1113,9 @@ func Test_DB_ReadOnlyQuery(t *testing.T) {
 
 	ctx := context.Background()
 	for i := 0; i < 100; i++ {
-		buf, err := samples.ToBuffer(table.Schema())
+		r, err := samples.ToRecord()
 		require.NoError(t, err)
-		_, err = table.InsertBuffer(ctx, buf)
+		_, err = table.InsertRecord(ctx, r)
 		require.NoError(t, err)
 	}
 	require.NoError(t, table.EnsureCompaction())
@@ -1408,8 +1125,8 @@ func Test_DB_ReadOnlyQuery(t *testing.T) {
 		WithLogger(logger),
 		WithWAL(),
 		WithStoragePath(dir),
-		WithBucketStorage(bucket),
-		WithActiveMemorySize(100*1024),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*KiB),
 	)
 	require.NoError(t, err)
 	defer c.Close()
@@ -1419,10 +1136,10 @@ func Test_DB_ReadOnlyQuery(t *testing.T) {
 	engine := query.NewEngine(pool, db.TableProvider())
 	err = engine.ScanTable("test").
 		Aggregate(
-			[]logicalplan.Expr{logicalplan.Sum(logicalplan.Col("value"))},
+			[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
 			[]logicalplan.Expr{logicalplan.Col("labels.label2")},
 		).
-		Execute(context.Background(), func(ctx context.Context, r arrow.Record) error {
+		Execute(context.Background(), func(_ context.Context, _ arrow.Record) error {
 			return nil
 		})
 	require.NoError(t, err)
@@ -1445,6 +1162,10 @@ func TestDBRecover(t *testing.T) {
 				WithStoragePath(dir),
 				WithWAL(),
 				WithSnapshotTriggerSize(1),
+				// Disable reclaiming disk space on snapshot (i.e. deleting
+				// old snapshots and WAL). This allows us to modify on-disk
+				// state for some tests.
+				WithTestingOptions(WithTestingNoDiskSpaceReclaimOnSnapshot()),
 			},
 				options...,
 			)...,
@@ -1459,23 +1180,27 @@ func TestDBRecover(t *testing.T) {
 		require.NoError(t, err)
 
 		// Insert 3 txns.
-		var lastWriteTx uint64
 		for i := 0; i < numInserts; i++ {
 			samples := dynparquet.NewTestSamples()
 			for j := range samples {
 				samples[j].Timestamp = int64(i)
 			}
-			buf, err := samples.ToBuffer(table.schema)
+			r, err := samples.ToRecord()
 			require.NoError(t, err)
-			writeTx, err := table.InsertBuffer(ctx, buf)
+			_, err = table.InsertRecord(ctx, r)
 			require.NoError(t, err)
+			// Wait until a snapshot is written for each write (it is the txn
+			// immediately preceding the write). This has to be done in a loop,
+			// otherwise writes may not cause a snapshot given that there
+			// might be a snapshot in progress.
 			if i > 0 {
-				// Wait until a snapshot is written for each write (it is the txn
-				// immediately preceding the write). This has to be done in a loop,
-				// otherwise writes may not cause a snapshot given that there
-				// might be a snapshot in progress.
-				db.Wait(writeTx - 1)
-				lastWriteTx = writeTx
+				require.Eventually(t, func() bool {
+					files, err := os.ReadDir(db.snapshotsDir())
+					if err != nil {
+						return false
+					}
+					return len(files) == i && !db.snapshotInProgress.Load()
+				}, 30*time.Second, 100*time.Millisecond)
 			}
 		}
 		// At this point, there should be 2 snapshots. One was triggered before
@@ -1483,10 +1208,17 @@ func TestDBRecover(t *testing.T) {
 		if blockRotation {
 			// A block rotation should trigger the third snapshot.
 			require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
-			// Wait for both the new block txn, and the old block rotation txn.
-			db.Wait(lastWriteTx + 2)
+			// Wait for the snapshot to complete
+			require.Eventually(t, func() bool {
+				files, err := os.ReadDir(db.snapshotsDir())
+				if err != nil {
+					return false
+				}
+				return len(files) == 3 && !db.snapshotInProgress.Load()
+			}, 30*time.Second, 100*time.Millisecond)
 		}
 
+		// Verify that there are now 3 snapshots and their txns.
 		files, err := os.ReadDir(db.snapshotsDir())
 		require.NoError(t, err)
 		snapshotTxns := make([]uint64, 0, len(files))
@@ -1499,7 +1231,6 @@ func TestDBRecover(t *testing.T) {
 		if blockRotation {
 			expectedSnapshots = append(expectedSnapshots, 8)
 		}
-		// Verify that there are now 3 snapshots and their txns.
 		require.Equal(t, expectedSnapshots, snapshotTxns)
 		return dir
 	}
@@ -1542,10 +1273,10 @@ func TestDBRecover(t *testing.T) {
 		for i := range samples {
 			samples[i].Timestamp = numInserts
 		}
-		buf, err := samples.ToBuffer(table.schema)
+		r, err := samples.ToRecord()
 		require.NoError(t, err)
 
-		writeTx, err := table.InsertBuffer(ctx, buf)
+		writeTx, err := table.InsertRecord(ctx, r)
 		require.NoError(t, err)
 
 		require.Eventually(t, func() bool {
@@ -1571,7 +1302,7 @@ func TestDBRecover(t *testing.T) {
 
 		db, err := c.DB(ctx, dbAndTableName)
 		require.NoError(t, err)
-		table, err := db.Table(dbAndTableName, nil)
+		table, err := db.GetTable(dbAndTableName)
 		require.NoError(t, err)
 		newWriteAndExpectWALRecord(t, db, table)
 	})
@@ -1582,13 +1313,19 @@ func TestDBRecover(t *testing.T) {
 		dir := setup(t, false)
 
 		snapshotsPath := filepath.Join(dir, "databases", dbAndTableName, "snapshots")
+		// Since we snapshot on close, the latest snapshot might not have been
+		// written yet.
+		var files []os.DirEntry
+		require.Eventually(t, func() bool {
+			var err error
+			files, err = os.ReadDir(snapshotsPath)
+			require.NoError(t, err)
+			return len(files) == 3
+		}, 1*time.Second, 100*time.Millisecond)
+		require.NoError(t, os.RemoveAll(filepath.Join(snapshotsPath, files[len(files)-1].Name())))
 		files, err := os.ReadDir(snapshotsPath)
 		require.NoError(t, err)
 		require.Equal(t, 2, len(files))
-		require.NoError(t, os.RemoveAll(filepath.Join(snapshotsPath, files[len(files)-1].Name())))
-		files, err = os.ReadDir(snapshotsPath)
-		require.NoError(t, err)
-		require.Equal(t, 1, len(files))
 
 		c, err := New(
 			WithLogger(newTestLogger(t)),
@@ -1603,17 +1340,33 @@ func TestDBRecover(t *testing.T) {
 	// WithBucket ensures normal behavior of recovery in case of graceful
 	// shutdown of a column store with bucket storage.
 	t.Run("WithBucket", func(t *testing.T) {
-		bucket, err := filesystem.NewBucket(t.TempDir())
-		require.NoError(t, err)
+		bucket := objstore.NewInMemBucket()
+		sinksource := NewDefaultObjstoreBucket(bucket)
+		dir := setup(t, true, WithReadWriteStorage(sinksource))
 
-		dir := setup(t, true, WithBucketStorage(bucket))
+		// The previous wal and snapshots directories should be empty since data
+		// is persisted on Close, rendering the directories useless.
+		databasesDir := filepath.Join(dir, "databases")
+		entries, err := os.ReadDir(databasesDir)
+		require.NoError(t, err)
+		for _, e := range entries {
+			dbEntries, err := os.ReadDir(filepath.Join(databasesDir, e.Name()))
+			require.NoError(t, err)
+			if len(dbEntries) > 0 {
+				entryNames := make([]string, 0, len(dbEntries))
+				for _, e := range dbEntries {
+					entryNames = append(entryNames, e.Name())
+				}
+				t.Fatalf("expected an empty dir but found the following entries: %v", entryNames)
+			}
+		}
 
 		c, err := New(
 			WithLogger(newTestLogger(t)),
 			WithStoragePath(dir),
 			WithWAL(),
 			WithSnapshotTriggerSize(1),
-			WithBucketStorage(bucket),
+			WithReadWriteStorage(sinksource),
 		)
 		require.NoError(t, err)
 		defer c.Close()
@@ -1623,6 +1376,195 @@ func TestDBRecover(t *testing.T) {
 		table, err := db.Table(dbAndTableName, NewTableConfig(dynparquet.SampleDefinition()))
 		require.NoError(t, err)
 		newWriteAndExpectWALRecord(t, db, table)
+	})
+
+	// SnapshotOnRecovery verifies that a snapshot is taken on recovery if the
+	// WAL indicates that a block was rotated but no snapshot was taken.
+	t.Run("SnapshotOnRecovery", func(t *testing.T) {
+		dir := setup(t, false)
+		c, err := New(
+			WithLogger(newTestLogger(t)),
+			WithStoragePath(dir),
+			WithWAL(),
+			// This option will disable snapshots on block rotation.
+			WithSnapshotTriggerSize(0),
+		)
+		require.NoError(t, err)
+
+		snapshotsPath := filepath.Join(dir, "databases", dbAndTableName, "snapshots")
+		snapshots, err := os.ReadDir(snapshotsPath)
+		require.NoError(t, err)
+
+		seenSnapshots := make(map[string]struct{})
+		for _, s := range snapshots {
+			seenSnapshots[s.Name()] = struct{}{}
+		}
+
+		db, err := c.DB(ctx, dbAndTableName)
+		require.NoError(t, err)
+		table, err := db.GetTable(dbAndTableName)
+		require.NoError(t, err)
+
+		require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
+
+		rec, err := dynparquet.NewTestSamples().ToRecord()
+		require.NoError(t, err)
+
+		insertTx, err := table.InsertRecord(ctx, rec)
+		require.NoError(t, err)
+
+		// RotateBlock again, this should log a couple of persisted block WAL
+		// entries.
+		require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
+		require.NoError(t, c.Close())
+
+		c, err = New(
+			WithLogger(newTestLogger(t)),
+			WithStoragePath(dir),
+			WithWAL(),
+			// Enable snapshots.
+			WithSnapshotTriggerSize(1),
+		)
+		require.NoError(t, err)
+		defer c.Close()
+
+		snapshots, err = os.ReadDir(snapshotsPath)
+		require.NoError(t, err)
+
+		for _, s := range snapshots {
+			tx, err := getTxFromSnapshotFileName(s.Name())
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, tx, insertTx, "expected only snapshots after insert txn")
+		}
+		db, err = c.DB(ctx, dbAndTableName)
+		require.NoError(t, err)
+
+		require.Eventually(t, func() bool {
+			numBlockPersists := 0
+			require.NoError(t, db.wal.Replay(0, func(_ uint64, entry *walpb.Record) error {
+				if _, ok := entry.Entry.EntryType.(*walpb.Entry_TableBlockPersisted_); ok {
+					numBlockPersists++
+				}
+				return nil
+			}))
+			return numBlockPersists <= 1
+		}, 1*time.Second, 10*time.Millisecond,
+			"expected at most one block persist entry; the others should have been snapshot and truncated",
+		)
+	})
+
+	// This test is a regression test to verify that writes completed during
+	// a block rotation are not lost on recovery.
+	t.Run("RotationDoesntDropWrites", func(t *testing.T) {
+		dir := setup(t, false)
+		c, err := New(
+			WithLogger(newTestLogger(t)),
+			WithStoragePath(dir),
+			WithWAL(),
+		)
+		require.NoError(t, err)
+
+		db, err := c.DB(ctx, dbAndTableName)
+		require.NoError(t, err)
+		table, err := db.GetTable(dbAndTableName)
+		require.NoError(t, err)
+
+		// Simulate starting a write against the active block, this will block
+		// persistence until this write is finished.
+		block, finish, err := table.ActiveWriteBlock()
+		require.NoError(t, err)
+
+		// Rotate the block to create a new active block.
+		require.NoError(t, table.RotateBlock(ctx, block))
+
+		// Issue writes.
+		const nWrites = 5
+		expectedTimestamps := make(map[int64]struct{}, nWrites)
+		for i := 0; i < nWrites; i++ {
+			samples := dynparquet.NewTestSamples()
+			timestamp := rand.Int63()
+			for j := range samples {
+				samples[j].Timestamp = timestamp
+			}
+			r, err := samples.ToRecord()
+			require.NoError(t, err)
+			_, err = table.InsertRecord(ctx, r)
+			require.NoError(t, err)
+			expectedTimestamps[timestamp] = struct{}{}
+		}
+
+		// Finalize the block persistence and close the DB.
+		finish()
+
+		require.NoError(t, c.Close())
+		c, err = New(
+			WithLogger(newTestLogger(t)),
+			WithStoragePath(dir),
+			WithWAL(),
+		)
+		require.NoError(t, err)
+		defer c.Close()
+
+		db, err = c.DB(ctx, dbAndTableName)
+		require.NoError(t, err)
+
+		require.NoError(
+			t,
+			query.NewEngine(
+				memory.DefaultAllocator, db.TableProvider(),
+			).ScanTable(dbAndTableName).Execute(ctx, func(_ context.Context, r arrow.Record) error {
+				idxs := r.Schema().FieldIndices("timestamp")
+				require.Len(t, idxs, 1)
+				tCol := r.Column(idxs[0]).(*array.Int64)
+				for i := 0; i < tCol.Len(); i++ {
+					delete(expectedTimestamps, tCol.Value(i))
+				}
+				return nil
+			}),
+		)
+		require.Len(t, expectedTimestamps, 0, "expected to see all timestamps on recovery, but could not find %v", expectedTimestamps)
+	})
+
+	// This is a regression test for a bug found by DST that causes duplicate
+	// writes on recovery due to an off-by-one error in WAL truncation after
+	// a snapshot (WAL includes a write that is also in the snapshot).
+	t.Run("NoDuplicateWrites", func(t *testing.T) {
+		dir := setup(t, false)
+		c, err := New(
+			WithLogger(newTestLogger(t)),
+			WithStoragePath(dir),
+			WithWAL(),
+		)
+		require.NoError(t, err)
+		defer c.Close()
+
+		db, err := c.DB(ctx, dbAndTableName)
+		require.NoError(t, err)
+
+		// This is deduced based on the fact that `setup` inserts NewTestSamples
+		// numInserts times.
+		expectedRowsPerTimestamp := len(dynparquet.NewTestSamples())
+
+		timestamps := make(map[int64]int, numInserts)
+		require.NoError(
+			t,
+			query.NewEngine(
+				memory.DefaultAllocator,
+				db.TableProvider(),
+			).ScanTable(dbAndTableName).Execute(ctx, func(_ context.Context, r arrow.Record) error {
+				idxs := r.Schema().FieldIndices("timestamp")
+				require.Len(t, idxs, 1)
+				tCol := r.Column(idxs[0]).(*array.Int64)
+				for i := 0; i < tCol.Len(); i++ {
+					timestamps[tCol.Value(i)]++
+				}
+				return nil
+			}),
+		)
+		require.Len(t, timestamps, numInserts, "expected %d timestamps, but got %d", numInserts, len(timestamps))
+		for ts, occurrences := range timestamps {
+			require.Equal(t, expectedRowsPerTimestamp, occurrences, "expected %d rows for timestamp %d, but got %d", expectedRowsPerTimestamp, ts, occurrences)
+		}
 	})
 }
 
@@ -1646,15 +1588,15 @@ func Test_DB_WalReplayTableConfig(t *testing.T) {
 	require.NoError(t, err)
 	table, err := db.Table("test", config)
 	require.NoError(t, err)
-	require.Equal(t, uint64(10), table.config.RowGroupSize)
+	require.Equal(t, uint64(10), table.config.Load().RowGroupSize)
 
 	samples := dynparquet.NewTestSamples()
 
 	ctx := context.Background()
 	for i := 0; i < 100; i++ {
-		buf, err := samples.ToBuffer(table.Schema())
+		r, err := samples.ToRecord()
 		require.NoError(t, err)
-		_, err = table.InsertBuffer(ctx, buf)
+		_, err = table.InsertRecord(ctx, r)
 		require.NoError(t, err)
 	}
 	require.NoError(t, c.Close())
@@ -1670,9 +1612,9 @@ func Test_DB_WalReplayTableConfig(t *testing.T) {
 	db, err = c.DB(ctx, "test")
 	require.NoError(t, err)
 
-	table, err = db.Table("test", nil) // Pass nil because we expect the table to already exist because of wal replay
+	table, err = db.GetTable("test")
 	require.NoError(t, err)
-	require.Equal(t, uint64(10), table.config.RowGroupSize)
+	require.Equal(t, uint64(10), table.config.Load().RowGroupSize)
 }
 
 func TestDBMinTXPersisted(t *testing.T) {
@@ -1689,9 +1631,9 @@ func TestDBMinTXPersisted(t *testing.T) {
 	require.NoError(t, err)
 
 	samples := dynparquet.NewTestSamples()
-	buf, err := samples.ToBuffer(table.schema)
+	r, err := samples.ToRecord()
 	require.NoError(t, err)
-	writeTx, err := table.InsertBuffer(ctx, buf)
+	writeTx, err := table.InsertRecord(ctx, r)
 	require.NoError(t, err)
 
 	require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
@@ -1719,4 +1661,1691 @@ func TestReplayBackwardsCompatibility(t *testing.T) {
 	c, err := New(WithWAL(), WithStoragePath(storagePath))
 	require.NoError(t, err)
 	defer c.Close()
+}
+
+func Test_DB_Limiter(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	c, err := New(
+		WithLogger(newTestLogger(t)),
+	)
+	defer func() {
+		_ = c.Close()
+	}()
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	ctx := context.Background()
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	for i := 0; i < 1024; i++ {
+		t.Run(fmt.Sprintf("limit-%v", i), func(t *testing.T) {
+			debug := memory.NewCheckedAllocator(memory.DefaultAllocator)
+			defer debug.AssertSize(t, 0)
+			pool := query.NewLimitAllocator(int64(i), debug)
+			engine := query.NewEngine(pool, db.TableProvider())
+			err = engine.ScanTable("test").
+				Filter(
+					logicalplan.And(
+						logicalplan.Col("labels.namespace").Eq(logicalplan.Literal("default")),
+					),
+				).
+				Aggregate(
+					[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
+					[]logicalplan.Expr{logicalplan.Col("labels.namespace")},
+				).
+				Execute(context.Background(), func(_ context.Context, _ arrow.Record) error {
+					return nil
+				})
+		})
+	}
+}
+
+// DropStorage ensures that a database can continue on after drop storage is called.
+func Test_DB_DropStorage(t *testing.T) {
+	logger := newTestLogger(t)
+	ctx := context.Background()
+	mem := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer mem.AssertSize(t, 0)
+
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	dir := t.TempDir()
+
+	// Use an actual prometheus registry to test duplicate metrics
+	// registration.
+	c, err := New(
+		WithLogger(logger),
+		WithRegistry(prometheus.NewRegistry()),
+		WithWAL(),
+		WithStoragePath(dir),
+		WithActiveMemorySize(1*MiB),
+	)
+	defer func() {
+		_ = c.Close()
+	}()
+	require.NoError(t, err)
+	const dbAndTableName = "test"
+	db, err := c.DB(ctx, dbAndTableName)
+	require.NoError(t, err)
+	table, err := db.Table(dbAndTableName, config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	for i := 0; i < 100; i++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		defer r.Release()
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	countRows := func(expected int) {
+		rows := 0
+		engine := query.NewEngine(mem, db.TableProvider())
+		err = engine.ScanTable(dbAndTableName).
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += int(r.NumRows())
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+	countRows(300)
+
+	level.Debug(logger).Log("msg", "dropping storage")
+	require.NoError(t, c.DropDB(dbAndTableName))
+
+	// Getting without creating a DB should return an error.
+	_, err = c.GetDB(dbAndTableName)
+	require.Error(t, err)
+
+	// Opening a new DB with the same name should be fine.
+	db, err = c.DB(ctx, dbAndTableName)
+	require.NoError(t, err)
+	// A table as well.
+	table, err = db.Table(dbAndTableName, config)
+	require.NoError(t, err)
+
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+	defer r.Release()
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+	// Expect a three rows in the table.
+	countRows(3)
+
+	// Dropping twice should be valid as well.
+	require.NoError(t, c.DropDB(dbAndTableName))
+
+	// Open a new store against the dropped storage, and expect empty db.
+	c, err = New(
+		WithLogger(logger),
+		WithWAL(),
+		WithStoragePath(dir),
+		WithActiveMemorySize(1*MiB),
+	)
+	defer func() {
+		_ = c.Close()
+	}()
+	require.NoError(t, err)
+	level.Debug(logger).Log("msg", "opening new db")
+	db, err = c.DB(ctx, dbAndTableName)
+	require.NoError(t, err)
+	_, err = db.Table(dbAndTableName, config)
+	require.NoError(t, err)
+	countRows(0)
+}
+
+func Test_DB_EngineInMemory(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+
+	dir := t.TempDir()
+	bucket := objstore.NewInMemBucket()
+
+	sinksource := NewDefaultObjstoreBucket(bucket)
+
+	c, err := New(
+		WithLogger(logger),
+		WithStoragePath(dir),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*1024),
+	)
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.NoError(t, c.Close())
+
+	c, err = New(
+		WithLogger(logger),
+		WithStoragePath(dir),
+		WithReadWriteStorage(sinksource),
+		WithActiveMemorySize(100*1024),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+
+	_, err = db.Table("test", config)
+	require.NoError(t, err)
+
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	engine := query.NewEngine(pool, db.TableProvider(), query.WithPhysicalplanOptions(physicalplan.WithReadMode(logicalplan.ReadModeInMemoryOnly)))
+	err = engine.ScanTable("test").
+		Aggregate(
+			[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
+			[]logicalplan.Expr{logicalplan.Col("labels.namespace")},
+		).
+		Execute(context.Background(), func(_ context.Context, _ arrow.Record) error {
+			t.FailNow() // should not be called
+			return nil
+		})
+	require.NoError(t, err)
+
+	engine = query.NewEngine(pool, db.TableProvider())
+	err = engine.ScanTable("test").
+		Aggregate(
+			[]*logicalplan.AggregationFunction{logicalplan.Sum(logicalplan.Col("value"))},
+			[]logicalplan.Expr{logicalplan.Col("labels.namespace")},
+		).
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			require.Equal(t, int64(2), r.NumRows())
+			return nil
+		})
+	require.NoError(t, err)
+}
+
+func Test_DB_SnapshotOnClose(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+	dir := t.TempDir()
+
+	c, err := New(
+		WithLogger(logger),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithActiveMemorySize(1*GiB),
+		WithSnapshotTriggerSize(1*GiB),
+		WithManualBlockRotation(),
+	)
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.NoError(t, c.Close())
+
+	// Check that we have a snapshot
+	found := false
+	require.NoError(t, filepath.WalkDir(dir, func(path string, _ fs.DirEntry, _ error) error {
+		if filepath.Ext(path) == ".fdbs" {
+			found = true
+		}
+		return nil
+	}))
+	require.True(t, found)
+}
+
+func Test_DB_All(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+
+	c, err := New(
+		WithLogger(logger),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	db, err := c.DB(context.Background(), t.Name())
+	require.NoError(t, err)
+	defer os.RemoveAll(t.Name())
+	table, err := db.Table(t.Name(), config)
+	require.NoError(t, err)
+
+	samples := dynparquet.Samples{{
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 1,
+		Value:     1,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 2,
+		Value:     2,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 3,
+		Value:     3,
+	}}
+
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	pool := memory.NewGoAllocator()
+	engine := query.NewEngine(pool, db.TableProvider())
+	err = engine.ScanTable(t.Name()).
+		Project(logicalplan.All()).
+		Filter(logicalplan.Col("timestamp").GtEq(logicalplan.Literal(2))).
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			require.Equal(t, int64(2), r.NumRows())
+			require.Equal(t, int64(8), r.NumCols())
+			return nil
+		})
+	require.NoError(t, err)
+}
+
+func Test_DB_PrehashedStorage(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.PrehashedSampleDefinition(),
+	)
+
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
+	logger := newTestLogger(t)
+
+	c, err := New(
+		WithLogger(logger),
+		WithReadWriteStorage(sinksource),
+	)
+	require.NoError(t, err)
+
+	db, err := c.DB(context.Background(), t.Name())
+	require.NoError(t, err)
+	defer os.RemoveAll(t.Name())
+	table, err := db.Table(t.Name(), config)
+	require.NoError(t, err)
+
+	samples := dynparquet.Samples{{
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 1,
+		Value:     1,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 2,
+		Value:     2,
+	}, {
+		ExampleType: "test",
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
+		},
+		Stacktrace: []uuid.UUID{
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
+			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
+		},
+		Timestamp: 3,
+		Value:     3,
+	}}
+
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	// Gracefully close the db to persist blocks
+	c.Close()
+
+	c, err = New(
+		WithLogger(logger),
+		WithReadWriteStorage(sinksource),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	db, err = c.DB(context.Background(), t.Name())
+	require.NoError(t, err)
+	table, err = db.Table(t.Name(), config)
+	require.NoError(t, err)
+
+	// Read the raw data back and expect prehashed columns to be returned
+	allocator := memory.NewCheckedAllocator(memory.NewGoAllocator())
+	defer allocator.AssertSize(t, 0)
+	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
+		return table.Iterator(
+			ctx,
+			tx,
+			allocator,
+			[]logicalplan.Callback{func(_ context.Context, ar arrow.Record) error {
+				require.Equal(t, int64(3), ar.NumRows())
+				require.Equal(t, int64(13), ar.NumCols())
+				return nil
+			}},
+		)
+	})
+	require.NoError(t, err)
+}
+
+// TestDBConcurrentOpen verifies that concurrent calls to open a DB do not
+// result in a panic (most likely due to duplicate metrics registration).
+func TestDBConcurrentOpen(t *testing.T) {
+	const (
+		concurrency = 16
+		dbName      = "test"
+	)
+
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
+	logger := newTestLogger(t)
+	tempDir := t.TempDir()
+
+	c, err := New(
+		WithLogger(logger),
+		WithReadWriteStorage(sinksource),
+		WithWAL(),
+		WithStoragePath(tempDir),
+	)
+	require.NoError(t, err)
+	defer c.Close()
+
+	var errg errgroup.Group
+	for i := 0; i < concurrency; i++ {
+		errg.Go(func() error {
+			return recovery.Do(func() error {
+				_, err := c.DB(context.Background(), dbName)
+				return err
+			})()
+		})
+	}
+	require.NoError(t, errg.Wait())
+}
+
+func Test_DB_WithParquetDiskCompaction(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+
+	cfg := DefaultIndexConfig()
+	cfg[0].Type = index.CompactionTypeParquetDisk // Create disk compaction
+	cfg[1].Type = index.CompactionTypeParquetDisk
+	c, err := New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithWAL(),
+		WithStoragePath(t.TempDir()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	ctx := context.Background()
+	for i := 0; i < 100; i++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.NoError(t, table.EnsureCompaction())
+
+	// Ensure that disk compacted data can be recovered
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	rows := int64(0)
+	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
+		return table.Iterator(
+			ctx,
+			tx,
+			pool,
+			[]logicalplan.Callback{func(_ context.Context, ar arrow.Record) error {
+				rows += ar.NumRows()
+				return nil
+			}},
+		)
+	})
+	require.NoError(t, err)
+	require.Equal(t, int64(300), rows)
+}
+
+func Test_DB_PersistentDiskCompaction(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+
+	type write struct {
+		n                int
+		ensureCompaction bool
+		op               func(table *Table, dir string)
+	}
+
+	defaultWrites := []write{
+		{
+			n:                100,
+			ensureCompaction: true,
+		},
+		{
+			n:                100,
+			ensureCompaction: true,
+		},
+		{
+			n:                100,
+			ensureCompaction: true,
+		},
+		{
+			n: 100,
+		},
+	}
+
+	tests := map[string]struct {
+		beforeReplay func(table *Table, dir string)
+		beforeClose  func(table *Table, dir string)
+		lvl2Parts    int
+		lvl1Parts    int
+		finalRows    int64
+		writes       []write
+	}{
+		"happy path": {
+			beforeReplay: func(_ *Table, _ string) {},
+			beforeClose:  func(_ *Table, _ string) {},
+			lvl2Parts:    3,
+			lvl1Parts:    1,
+			finalRows:    1200,
+			writes:       defaultWrites,
+		},
+		"corrupted L1": {
+			beforeClose: func(_ *Table, _ string) {},
+			lvl2Parts:   3,
+			lvl1Parts:   1,
+			finalRows:   1200,
+			writes:      defaultWrites,
+			beforeReplay: func(table *Table, _ string) {
+				// Corrupt the LSM file; this should trigger a recovery from the WAL
+				l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+				levelFile := filepath.Join(l1Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				info, err := os.Stat(levelFile)
+				require.NoError(t, err)
+				require.NoError(t, os.Truncate(levelFile, info.Size()-1)) // truncate the last byte to pretend the write didn't finish
+			},
+		},
+		"corrupted L2": {
+			beforeClose: func(_ *Table, _ string) {},
+			lvl2Parts:   4,
+			lvl1Parts:   0,
+			finalRows:   1200,
+			beforeReplay: func(table *Table, _ string) {
+				// Corrupt the LSM file; this should trigger a recovery from the WAL
+				l2Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L2")
+				levelFile := filepath.Join(l2Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				info, err := os.Stat(levelFile)
+				require.NoError(t, err)
+				require.NoError(t, os.Truncate(levelFile, info.Size()-1)) // truncate the last byte to pretend the write didn't finish
+			},
+			writes: []write{
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+			},
+		},
+		"L1 cleanup failure with corruption": { // Compaction from L1->L2 happens, but L1 is not cleaned up and L2 gets corrupted
+			beforeClose: func(_ *Table, _ string) {},
+			lvl2Parts:   1,
+			lvl1Parts:   0,
+			finalRows:   300,
+			beforeReplay: func(table *Table, _ string) {
+				// Copy the L2 file back to L1 to simulate that it was not cleaned up
+				l2Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L2")
+				l2File := filepath.Join(l2Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				l2, err := os.Open(l2File)
+				require.NoError(t, err)
+
+				l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+				l1File := filepath.Join(l1Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				l1, err := os.Create(l1File)
+				require.NoError(t, err)
+
+				_, err = io.Copy(l1, l2)
+				require.NoError(t, err)
+				require.NoError(t, l2.Close())
+				require.NoError(t, l1.Close())
+
+				// Corrupt the L2 file
+				info, err := os.Stat(l2File)
+				require.NoError(t, err)
+				require.NoError(t, os.Truncate(l2File, info.Size()-1)) // truncate the last byte to pretend the write didn't finish
+			},
+			writes: []write{
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+			},
+		},
+		"L1 cleanup failure": { // Compaction from L1->L2 happens, but L1 is not cleaned up
+			beforeClose: func(_ *Table, _ string) {},
+			lvl2Parts:   1,
+			lvl1Parts:   0,
+			finalRows:   300,
+			beforeReplay: func(table *Table, _ string) {
+				// Copy the L2 file back to L1 to simulate that it was not cleaned up
+				l2Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L2")
+				l2File := filepath.Join(l2Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				l2, err := os.Open(l2File)
+				require.NoError(t, err)
+
+				l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+				l1File := filepath.Join(l1Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				l1, err := os.Create(l1File)
+				require.NoError(t, err)
+
+				_, err = io.Copy(l1, l2)
+				require.NoError(t, err)
+				require.NoError(t, l2.Close())
+				require.NoError(t, l1.Close())
+			},
+			writes: []write{
+				{
+					n:                100,
+					ensureCompaction: true,
+				},
+			},
+		},
+		"L1 cleanup failure with corruption after snapshot": { // Snapshot happens after L1 compaction; Then compaction happens from L1->L2, but L1 is not cleaned up and L2 gets corrupted
+			beforeClose: func(_ *Table, _ string) {},
+			lvl2Parts:   1,
+			lvl1Parts:   0,
+			finalRows:   303,
+			beforeReplay: func(table *Table, _ string) {
+				// Move the save files back into L1 to simulate an unssuccessful cleanup after L1 compaction
+				l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+				saveDir := filepath.Join(table.db.indexDir(), "save")
+				require.NoError(t, filepath.WalkDir(saveDir, func(path string, _ fs.DirEntry, _ error) error {
+					if filepath.Ext(path) == index.IndexFileExtension {
+						// Move the save file back to the original file
+						sv, err := os.Open(path)
+						require.NoError(t, err)
+						defer sv.Close()
+
+						lvl, err := os.Create(filepath.Join(l1Dir, filepath.Base(path)))
+						require.NoError(t, err)
+						defer lvl.Close()
+
+						_, err = io.Copy(lvl, sv)
+						require.NoError(t, err)
+					}
+					return nil
+				}))
+
+				// Corrupt the L2 file to simulate that the failure occurred when writing the L2 file
+				l2Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L2")
+				l2File := filepath.Join(l2Dir, fmt.Sprintf("00000000000000000000%s", index.IndexFileExtension))
+				info, err := os.Stat(l2File)
+				require.NoError(t, err)
+				require.NoError(t, os.Truncate(l2File, info.Size()-1)) // truncate the last byte to pretend the write didn't finish
+			},
+			writes: []write{
+				{ // Get to L1 compaction
+					n: 100,
+					op: func(table *Table, _ string) {
+						require.Eventually(t, func() bool {
+							return table.active.index.LevelSize(index.L1) != 0
+						}, time.Second, time.Millisecond*10)
+					},
+				},
+				{ // trigger a snapshot (leaving the only valid data in L1)
+					op: func(table *Table, _ string) {
+						tx := table.db.highWatermark.Load()
+						require.NoError(t, table.db.snapshotAtTX(context.Background(), tx, table.db.snapshotWriter(tx)))
+					},
+				},
+				{
+					op: func(table *Table, dir string) { // save the L1 files to restore them
+						l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+						saveDir := filepath.Join(dir, "save")
+						require.NoError(t, os.MkdirAll(saveDir, 0o755)) // Create a directory to save the files
+						require.NoError(t, filepath.WalkDir(l1Dir, func(path string, _ fs.DirEntry, _ error) error {
+							if filepath.Ext(path) == index.IndexFileExtension {
+								lvl, err := os.Open(path)
+								require.NoError(t, err)
+								defer lvl.Close()
+
+								sv, err := os.Create(filepath.Join(saveDir, filepath.Base(path)))
+								require.NoError(t, err)
+								defer sv.Close()
+
+								_, err = io.Copy(sv, lvl)
+								require.NoError(t, err)
+							}
+							return nil
+						}))
+					},
+				},
+				{ // Compact L1->L2
+					n:                1, // New write to "trigger" the compaction
+					ensureCompaction: true,
+				},
+			},
+		},
+		"snapshot": {
+			beforeReplay: func(_ *Table, _ string) {},
+			beforeClose: func(table *Table, _ string) {
+				// trigger a snapshot
+				success := false
+				table.db.snapshot(context.Background(), false, func() {
+					success = true
+				})
+				require.True(t, success)
+
+				// Write more to the table and trigger a compaction
+				samples := dynparquet.NewTestSamples()
+				for j := 0; j < 100; j++ {
+					r, err := samples.ToRecord()
+					require.NoError(t, err)
+					_, err = table.InsertRecord(context.Background(), r)
+					require.NoError(t, err)
+				}
+				require.Eventually(t, func() bool {
+					return table.active.index.LevelSize(index.L1) != 0
+				}, time.Second, time.Millisecond*10)
+			},
+			lvl2Parts: 3,
+			lvl1Parts: 2,
+			finalRows: 1500,
+			writes:    defaultWrites,
+		},
+		"corruption after snapshot": {
+			beforeReplay: func(table *Table, _ string) {
+				l1Dir := filepath.Join(table.db.indexDir(), "test", table.active.ulid.String(), "L1")
+				levelFile := filepath.Join(l1Dir, fmt.Sprintf("00000000000000000001%v", index.IndexFileExtension))
+				info, err := os.Stat(levelFile)
+				require.NoError(t, err)
+				require.NoError(t, os.Truncate(levelFile, info.Size()-1)) // truncate the last byte to pretend the write didn't finish
+			},
+			beforeClose: func(table *Table, _ string) {
+				// trigger a snapshot
+				tx := table.db.highWatermark.Load()
+				require.NoError(t, table.db.snapshotAtTX(context.Background(), tx, table.db.snapshotWriter(tx)))
+
+				// Write more to the table and trigger a compaction
+				samples := dynparquet.NewTestSamples()
+				for j := 0; j < 100; j++ {
+					r, err := samples.ToRecord()
+					require.NoError(t, err)
+					_, err = table.InsertRecord(context.Background(), r)
+					require.NoError(t, err)
+				}
+				require.Eventually(t, func() bool {
+					return table.active.index.LevelSize(index.L1) != 0
+				}, time.Second, time.Millisecond*10)
+			},
+			lvl2Parts: 3,
+			lvl1Parts: 2,
+			finalRows: 1500,
+			writes:    defaultWrites,
+		},
+	}
+
+	for name, test := range tests {
+		test := test
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			cfg := []*index.LevelConfig{
+				{Level: index.L0, MaxSize: 25700, Type: index.CompactionTypeParquetDisk},
+				{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetDisk},
+				{Level: index.L2, MaxSize: 1024 * 1024 * 512},
+			}
+			c, err := New(
+				WithLogger(logger),
+				WithIndexConfig(cfg),
+				WithStoragePath(dir),
+				WithWAL(),
+			)
+			t.Cleanup(func() {
+				require.NoError(t, c.Close())
+			})
+			require.NoError(t, err)
+			db, err := c.DB(context.Background(), "test")
+			require.NoError(t, err)
+			table, err := db.Table("test", config)
+			require.NoError(t, err)
+
+			samples := dynparquet.NewTestSamples()
+
+			ctx := context.Background()
+			insertedRows := int64(0)
+			for _, w := range test.writes {
+				for j := 0; j < w.n; j++ {
+					r, err := samples.ToRecord()
+					require.NoError(t, err)
+					_, err = table.InsertRecord(ctx, r)
+					insertedRows += r.NumRows()
+					require.NoError(t, err)
+				}
+				if w.ensureCompaction {
+					require.NoError(t, table.EnsureCompaction())
+				}
+				if w.op != nil {
+					w.op(table, db.indexDir())
+				}
+			}
+
+			if test.lvl1Parts > 0 {
+				require.Eventually(t, func() bool {
+					return table.active.index.LevelSize(index.L1) != 0
+				}, 30*time.Second, time.Millisecond*10)
+			}
+
+			rows := func(db *DB) int64 {
+				pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+				defer pool.AssertSize(t, 0)
+				rows := int64(0)
+				engine := query.NewEngine(pool, db.TableProvider())
+				err = engine.ScanTable("test").
+					Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+						rows += r.NumRows()
+						return nil
+					})
+				require.NoError(t, err)
+				return rows
+			}
+
+			// Ensure that disk compacted data can be recovered
+			require.Equal(t, insertedRows, rows(db))
+
+			test.beforeClose(table, dir)
+
+			// Close the database
+			require.NoError(t, c.Close())
+
+			// Run the beforeReplay hook
+			test.beforeReplay(table, dir)
+
+			// Reopen database; expect it to recover from the LSM files and WAL
+			c, err = New(
+				WithLogger(logger),
+				WithIndexConfig(cfg),
+				WithStoragePath(dir),
+				WithWAL(),
+			)
+			require.NoError(t, err)
+			t.Cleanup(func() {
+				require.NoError(t, c.Close())
+			})
+			db, err = c.DB(context.Background(), "test")
+			require.NoError(t, err)
+			table, err = db.Table("test", config)
+			require.NoError(t, err)
+
+			// Check the final row count
+			require.Equal(t, test.finalRows, rows(db))
+
+			// Now write more data after a recovery into the levels and ensure that it can be read back.
+
+			// L1 writes
+			l1Before := table.active.index.LevelSize(index.L1)
+			for j := 0; j < 100; j++ {
+				r, err := samples.ToRecord()
+				require.NoError(t, err)
+				_, err = table.InsertRecord(ctx, r)
+				require.NoError(t, err)
+			}
+			require.Eventually(t, func() bool {
+				return table.active.index.LevelSize(index.L1) != l1Before
+			}, 30*time.Second, time.Millisecond*10)
+			require.Equal(t, test.finalRows+300, rows(db))
+
+			// Move that data to L2
+			require.NoError(t, table.EnsureCompaction())
+			require.Equal(t, test.finalRows+300, rows(db))
+		})
+	}
+}
+
+// Ensure data integrity when a block is rotated.
+func Test_DB_PersistentDiskCompaction_BlockRotation(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+	bucket := objstore.NewInMemBucket()
+	sinksource := NewDefaultObjstoreBucket(bucket)
+
+	dir := t.TempDir()
+	cfg := []*index.LevelConfig{
+		{Level: index.L0, MaxSize: 25700, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L2, MaxSize: 1024 * 1024 * 512},
+	}
+	c, err := New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithReadWriteStorage(sinksource),
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	samples := dynparquet.NewTestSamples()
+
+	ctx := context.Background()
+	compactions := 3 // 3 compacted parts in L2 file
+	for i := 0; i < compactions; i++ {
+		for j := 0; j < 100; j++ {
+			r, err := samples.ToRecord()
+			require.NoError(t, err)
+			_, err = table.InsertRecord(ctx, r)
+			require.NoError(t, err)
+		}
+		require.NoError(t, table.EnsureCompaction())
+	}
+
+	// Get data in L1
+	for j := 0; j < 100; j++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		return table.active.index.LevelSize(index.L1) != 0
+	}, time.Second, time.Millisecond*10)
+
+	validateRows := func(expected int64) {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		rows := int64(0)
+		engine := query.NewEngine(pool, db.TableProvider())
+		err = engine.ScanTable("test").
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += r.NumRows()
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+
+	validateRows(1200)
+
+	// Rotate block
+	require.NoError(t, table.RotateBlock(context.Background(), table.ActiveBlock()))
+
+	validateRows(1200)
+
+	for i := 0; i < compactions; i++ {
+		for j := 0; j < 100; j++ {
+			r, err := samples.ToRecord()
+			require.NoError(t, err)
+			_, err = table.InsertRecord(ctx, r)
+			require.NoError(t, err)
+		}
+		require.NoError(t, table.EnsureCompaction())
+	}
+
+	// Get data in L1
+	for j := 0; j < 100; j++ {
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		return table.active.index.LevelSize(index.L1) != 0
+	}, time.Second, time.Millisecond*10)
+
+	validateRows(2400)
+}
+
+func Test_DB_PersistentDiskCompaction_NonOverlappingCompaction(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+
+	dir := t.TempDir()
+	cfg := []*index.LevelConfig{
+		{Level: index.L0, MaxSize: 336, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L2, MaxSize: 1024 * 1024 * 512},
+	}
+	c, err := New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	for i := 0; i < 3; i++ { // Create non-overlapping samples for compaction
+		samples := dynparquet.GenerateTestSamples(1)
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+	require.Eventually(t, func() bool {
+		return table.active.index.LevelSize(index.L1) != 0
+	}, time.Second, time.Millisecond*10)
+
+	// Snapshot the file
+	success := false
+	table.db.snapshot(context.Background(), false, func() {
+		success = true
+	})
+	require.True(t, success)
+
+	// Close the database
+	require.NoError(t, c.Close())
+
+	// Recover from the snapshot
+	c, err = New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err = db.Table("test", config)
+	require.NoError(t, err)
+
+	validateRows := func(expected int64) {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		rows := int64(0)
+		engine := query.NewEngine(pool, db.TableProvider())
+		err = engine.ScanTable("test").
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += r.NumRows()
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+
+	validateRows(3)
+}
+
+func TestDBWatermarkBubbling(t *testing.T) {
+	c, err := New()
+	require.NoError(t, err)
+	defer c.Close()
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+
+	const nTxns = 100
+	var wg sync.WaitGroup
+	wg.Add(nTxns)
+	for i := 0; i < nTxns; i++ {
+		_, _, commit := db.begin()
+		go func() {
+			defer wg.Done()
+			commit()
+		}()
+	}
+	wg.Wait()
+
+	require.Eventually(t, func() bool {
+		return db.HighWatermark() == nTxns
+	}, time.Second, 10*time.Millisecond)
+}
+
+// Test_DB_SnapshotNewerData verifies that newer data that is compacted doesn't cause duplicate or loss of data on replay.
+func Test_DB_SnapshotNewerData(t *testing.T) {
+	t.Parallel()
+
+	logger := newTestLogger(t)
+	tests := map[string]struct {
+		create func(dir string) *ColumnStore
+	}{
+		"memory": {
+			create: func(dir string) *ColumnStore {
+				c, err := New(
+					WithLogger(logger),
+					WithIndexConfig(DefaultIndexConfig()),
+					WithStoragePath(dir),
+					WithWAL(),
+					WithManualBlockRotation(),
+				)
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					require.NoError(t, c.Close())
+				})
+				return c
+			},
+		},
+		"disk": {
+			create: func(dir string) *ColumnStore {
+				cfg := DefaultIndexConfig()
+				cfg[0].Type = index.CompactionTypeParquetDisk
+				cfg[1].Type = index.CompactionTypeParquetDisk
+				c, err := New(
+					WithLogger(logger),
+					WithIndexConfig(cfg),
+					WithStoragePath(dir),
+					WithWAL(),
+					WithManualBlockRotation(),
+				)
+				require.NoError(t, err)
+				t.Cleanup(func() {
+					require.NoError(t, c.Close())
+				})
+				return c
+			},
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			config := NewTableConfig(
+				dynparquet.SampleDefinition(),
+			)
+
+			dir := t.TempDir()
+			c := test.create(dir)
+			db, err := c.DB(context.Background(), "test")
+			require.NoError(t, err)
+			table, err := db.Table("test", config)
+			require.NoError(t, err)
+
+			// Insert record to increase tx
+			ctx := context.Background()
+			for i := 0; i < 3; i++ {
+				samples := dynparquet.GenerateTestSamples(3)
+				r, err := samples.ToRecord()
+				require.NoError(t, err)
+				_, err = table.InsertRecord(ctx, r)
+				require.NoError(t, err)
+			}
+
+			// Get a snapshot tx
+			tx, _, commit := db.begin()
+
+			// Insert another write, and force compaction
+			samples := dynparquet.GenerateTestSamples(3)
+			r, err := samples.ToRecord()
+			require.NoError(t, err)
+			_, err = table.InsertRecord(ctx, r)
+			require.NoError(t, err)
+			require.NoError(t, table.EnsureCompaction())
+
+			// Now perform the snapshot
+			db.Wait(tx - 1)
+			err = db.wal.Log(
+				tx,
+				&walpb.Record{
+					Entry: &walpb.Entry{
+						EntryType: &walpb.Entry_Snapshot_{Snapshot: &walpb.Entry_Snapshot{Tx: tx}},
+					},
+				},
+			)
+			require.NoError(t, err)
+			require.NoError(t, db.snapshotAtTX(ctx, tx, db.offlineSnapshotWriter(tx)))
+			commit()
+			require.NoError(t, db.wal.Truncate(tx))
+			time.Sleep(1 * time.Second) // wal flushes every 50ms
+
+			// Close the database
+			require.NoError(t, c.Close())
+
+			// Recover from the snapshot
+			c = test.create(dir)
+			t.Cleanup(func() {
+				require.NoError(t, c.Close())
+			})
+			db, err = c.DB(context.Background(), "test")
+			require.NoError(t, err)
+
+			validateRows := func(expected int64) {
+				pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+				defer pool.AssertSize(t, 0)
+				rows := int64(0)
+				engine := query.NewEngine(pool, db.TableProvider())
+				err = engine.ScanTable("test").
+					Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+						rows += r.NumRows()
+						return nil
+					})
+				require.NoError(t, err)
+				require.Equal(t, expected, rows)
+			}
+
+			validateRows(12)
+		})
+	}
+}
+
+// Test_DB_SnapshotDuplicate verifies that if we attempt to take a snapshot again at the same tx that it will abort if the current snapshot is valid.
+func Test_DB_SnapshotDuplicate(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+
+	cfg := []*index.LevelConfig{
+		{Level: index.L0, MaxSize: 336, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L2, MaxSize: 1024 * 1024 * 512},
+	}
+	dir := t.TempDir()
+	c, err := New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithSnapshotTriggerSize(1024*1024*1024), // we just need a non-zero value; but don't want the writes to unexpectedly trigger a snapshot
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	samples := dynparquet.GenerateTestSamples(10)
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	require.NoError(t, table.EnsureCompaction())
+
+	// Snapshot the file
+	success := false
+	table.db.snapshot(context.Background(), false, func() {
+		success = true
+	})
+	require.True(t, success)
+
+	require.NoError(t, db.wal.Truncate(2))
+	time.Sleep(1 * time.Second) // wal flushes every 50ms
+
+	// Close the database to trigger a snapshot on close
+	require.NoError(t, c.Close())
+
+	// Reopen the database and expect the data to be there
+	c, err = New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithSnapshotTriggerSize(1024*1024*1024), // we just need a non-zero value; but don't want the writes to unexpectedly trigger a snapshot
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+
+	validateRows := func(expected int64) {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		rows := int64(0)
+		engine := query.NewEngine(pool, db.TableProvider())
+		err = engine.ScanTable("test").
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += r.NumRows()
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+
+	validateRows(10)
+}
+
+func Test_DB_SnapshotDuplicate_Corrupted(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+
+	cfg := []*index.LevelConfig{
+		{Level: index.L0, MaxSize: 336, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L1, MaxSize: 1024 * 1024 * 128, Type: index.CompactionTypeParquetDisk},
+		{Level: index.L2, MaxSize: 1024 * 1024 * 512},
+	}
+	dir := t.TempDir()
+	c, err := New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithSnapshotTriggerSize(1024*1024*1024), // we just need a non-zero value; but don't want the writes to unexpectedly trigger a snapshot
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	samples := dynparquet.GenerateTestSamples(10)
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	require.NoError(t, table.EnsureCompaction())
+
+	// Snapshot the file
+	success := false
+	table.db.snapshot(context.Background(), false, func() {
+		success = true
+	})
+	require.True(t, success)
+
+	require.NoError(t, db.wal.Truncate(2))
+	time.Sleep(1 * time.Second) // wal flushes every 50ms
+
+	// Corrupt the snapshot file.
+	require.NoError(t, os.Truncate(filepath.Join(SnapshotDir(db, 3), snapshotFileName(3)), 100))
+
+	// Close the database to trigger a snapshot on close
+	require.NoError(t, c.Close())
+
+	// Reopen the database and expect the data to be there
+	c, err = New(
+		WithLogger(logger),
+		WithIndexConfig(cfg),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithSnapshotTriggerSize(1024*1024*1024), // we just need a non-zero value; but don't want the writes to unexpectedly trigger a snapshot
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err = c.DB(context.Background(), "test")
+	require.NoError(t, err)
+
+	validateRows := func(expected int64) {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		rows := int64(0)
+		engine := query.NewEngine(pool, db.TableProvider())
+		err = engine.ScanTable("test").
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += r.NumRows()
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+
+	validateRows(10)
+}
+
+func Test_Iceberg(t *testing.T) {
+	t.Parallel()
+
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+	bucket := &TestBucket{Bucket: objstore.NewInMemBucket(), record: make(map[string]struct{})}
+	iceberg, err := storage.NewIceberg("/", catalog.NewHDFS("/", bucket), bucket,
+		storage.WithIcebergPartitionSpec(
+			iceberg.NewPartitionSpec( // Partition the table by timestamp.
+				iceberg.PartitionField{
+					Name:      "timestamp",
+					Transform: iceberg.IdentityTransform{},
+				},
+			),
+		))
+	require.NoError(t, err)
+
+	dir := t.TempDir()
+	c, err := New(
+		WithLogger(logger),
+		WithStoragePath(dir),
+		WithWAL(),
+		WithManualBlockRotation(),
+		WithReadWriteStorage(iceberg),
+	)
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	samples := dynparquet.GenerateTestSamples(10)
+	r, err := samples.ToRecord()
+	require.NoError(t, err)
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	validateRows := func(expected int64) {
+		pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+		defer pool.AssertSize(t, 0)
+		rows := int64(0)
+		engine := query.NewEngine(pool, db.TableProvider())
+		err = engine.ScanTable("test").
+			Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+				rows += r.NumRows()
+				return nil
+			})
+		require.NoError(t, err)
+		require.Equal(t, expected, rows)
+	}
+
+	validateRows(10)
+
+	require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
+	require.Eventually(t, func() bool {
+		info, err := bucket.Attributes(ctx, filepath.Join("test", "test", "metadata", "v1.metadata.json"))
+		if err != nil {
+			return false
+		}
+		return info.Size > 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	validateRows(10)
+
+	// Insert sampels with a different schema
+	samples = dynparquet.NewTestSamples()
+	r, err = samples.ToRecord()
+	require.NoError(t, err)
+	_, err = table.InsertRecord(ctx, r)
+	require.NoError(t, err)
+
+	validateRows(13)
+
+	require.NoError(t, table.RotateBlock(ctx, table.ActiveBlock()))
+	require.Eventually(t, func() bool {
+		info, err := bucket.Attributes(ctx, filepath.Join("test", "test", "metadata", "v2.metadata.json"))
+		if err != nil {
+			return false
+		}
+		return info.Size > 0
+	}, 3*time.Second, 10*time.Millisecond)
+
+	validateRows(13)
+
+	// Reset the test bucket
+	bucket.Reset()
+
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	rows := int64(0)
+	engine := query.NewEngine(pool, db.TableProvider())
+	err = engine.ScanTable("test").Filter(
+		logicalplan.Col("timestamp").Gt(logicalplan.Literal(int64(2))),
+	).
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			rows += r.NumRows()
+			return nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, int64(7), rows)
+
+	// We expect the Iceberg table to only access a single Parquet file.
+	require.Len(t, bucket.record, 1)
+	bucket.Reset()
+
+	// query by a column that isn't part of the partition key
+	rows = 0
+	err = engine.ScanTable("test").Filter(
+		logicalplan.And(
+			logicalplan.Col("timestamp").Gt(logicalplan.Literal(int64(2))),
+			logicalplan.Col("value").Gt(logicalplan.Literal(int64(5))),
+		),
+	).
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			rows += r.NumRows()
+			return nil
+		})
+	require.NoError(t, err)
+	require.Len(t, bucket.record, 1)
+	require.Equal(t, int64(4), rows)
+}
+
+type TestBucket struct {
+	sync.Mutex
+	record map[string]struct{}
+	objstore.Bucket
+}
+
+func (b *TestBucket) Reset() {
+	b.record = make(map[string]struct{})
+}
+
+func (b *TestBucket) GetRange(ctx context.Context, path string, offset, length int64) (io.ReadCloser, error) {
+	b.Lock()
+	b.record[path] = struct{}{}
+	b.Unlock()
+	return b.Bucket.GetRange(ctx, path, offset, length)
+}
+
+// Test_DB_EmptyPersist ensures that we don't write an empty block when the db is shutdown and there is no data.
+func Test_DB_EmptyPersist(t *testing.T) {
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+
+	logger := newTestLogger(t)
+	assertBucket := &AssertBucket{
+		Bucket: objstore.NewInMemBucket(),
+		uploadFunc: func(_ context.Context, _ string, _ io.Reader) error {
+			t.Fatal("unexpected upload")
+			return nil
+		},
+	}
+
+	sinksource := NewDefaultObjstoreBucket(assertBucket)
+
+	c, err := New(
+		WithLogger(logger),
+		WithReadWriteStorage(sinksource),
+	)
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	_, err = db.Table("test", config)
+	require.NoError(t, err)
+
+	require.NoError(t, c.Close())
+}
+
+type AssertBucket struct {
+	objstore.Bucket
+
+	uploadFunc func(ctx context.Context, path string, r io.Reader) error
+}
+
+func (a *AssertBucket) Upload(ctx context.Context, path string, r io.Reader) error {
+	if a.uploadFunc != nil {
+		return a.uploadFunc(ctx, path, r)
+	}
+	return a.Bucket.Upload(ctx, path, r)
+}
+
+func Test_DB_Sample(t *testing.T) {
+	t.Parallel()
+	config := NewTableConfig(
+		dynparquet.SampleDefinition(),
+	)
+	logger := newTestLogger(t)
+
+	c, err := New(WithLogger(logger))
+	t.Cleanup(func() {
+		require.NoError(t, c.Close())
+	})
+	require.NoError(t, err)
+	db, err := c.DB(context.Background(), "test")
+	require.NoError(t, err)
+	table, err := db.Table("test", config)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	for i := 0; i < 500; i++ {
+		samples := dynparquet.GenerateTestSamples(10)
+		r, err := samples.ToRecord()
+		require.NoError(t, err)
+		_, err = table.InsertRecord(ctx, r)
+		require.NoError(t, err)
+	}
+
+	pool := memory.NewCheckedAllocator(memory.DefaultAllocator)
+	defer pool.AssertSize(t, 0)
+	lock := &sync.Mutex{}
+	rows := int64(0)
+	sampleSize := int64(13)
+	engine := query.NewEngine(pool, db.TableProvider())
+	err = engine.ScanTable("test").
+		Sample(sampleSize, 1024*1024). // Sample 13 rows, materialize the reservoir at 1MB
+		Execute(context.Background(), func(_ context.Context, r arrow.Record) error {
+			lock.Lock()
+			defer lock.Unlock()
+			rows += r.NumRows()
+			return nil
+		})
+	require.NoError(t, err)
+	require.Equal(t, sampleSize, rows)
 }

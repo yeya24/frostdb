@@ -4,20 +4,20 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
 )
 
 func TestReader(t *testing.T) {
 	schema := NewSampleSchema()
 	samples := NewTestSamples()
-	buf, err := samples.ToBuffer(schema)
+	buf, err := ToBuffer(samples, schema)
 	require.NoError(t, err)
 
 	b := bytes.NewBuffer(nil)
 	w, err := schema.NewWriter(b, map[string][]string{
 		"labels": samples.SampleLabelNames(),
-	})
+	}, false)
 	require.NoError(t, err)
 
 	_, err = parquet.CopyRows(w, buf.Rows())
@@ -33,7 +33,7 @@ func TestReader(t *testing.T) {
 func TestSerializedReader(t *testing.T) {
 	schema := NewSampleSchema()
 	samples := NewTestSamples()
-	buf, err := samples.ToBuffer(schema)
+	buf, err := ToBuffer(samples, schema)
 	require.NoError(t, err)
 
 	b := bytes.NewBuffer(nil)

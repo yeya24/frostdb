@@ -3,8 +3,10 @@ package query
 import (
 	"context"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/query/logicalplan"
@@ -12,12 +14,14 @@ import (
 )
 
 type Builder interface {
-	Aggregate(aggExpr, groupExprs []logicalplan.Expr) Builder
+	Aggregate(aggExpr []*logicalplan.AggregationFunction, groupExprs []logicalplan.Expr) Builder
 	Filter(expr logicalplan.Expr) Builder
 	Distinct(expr ...logicalplan.Expr) Builder
 	Project(projections ...logicalplan.Expr) Builder
+	Limit(expr logicalplan.Expr) Builder
 	Execute(ctx context.Context, callback func(ctx context.Context, r arrow.Record) error) error
 	Explain(ctx context.Context) (string, error)
+	Sample(size, limitInBytes int64) Builder
 }
 
 type LocalEngine struct {
@@ -48,7 +52,7 @@ func NewEngine(
 ) *LocalEngine {
 	e := &LocalEngine{
 		pool:          pool,
-		tracer:        trace.NewNoopTracerProvider().Tracer(""),
+		tracer:        noop.NewTracerProvider().Tracer(""),
 		tableProvider: tableProvider,
 	}
 
@@ -85,7 +89,7 @@ func (e *LocalEngine) ScanSchema(name string) Builder {
 }
 
 func (b LocalQueryBuilder) Aggregate(
-	aggExpr []logicalplan.Expr,
+	aggExpr []*logicalplan.AggregationFunction,
 	groupExprs []logicalplan.Expr,
 ) Builder {
 	return LocalQueryBuilder{
@@ -129,6 +133,28 @@ func (b LocalQueryBuilder) Project(
 	}
 }
 
+func (b LocalQueryBuilder) Limit(
+	expr logicalplan.Expr,
+) Builder {
+	return LocalQueryBuilder{
+		pool:        b.pool,
+		tracer:      b.tracer,
+		planBuilder: b.planBuilder.Limit(expr),
+		execOpts:    b.execOpts,
+	}
+}
+
+func (b LocalQueryBuilder) Sample(
+	size, limitInBytes int64,
+) Builder {
+	return LocalQueryBuilder{
+		pool:        b.pool,
+		tracer:      b.tracer,
+		planBuilder: b.planBuilder.Sample(logicalplan.Literal(size), logicalplan.Literal(limitInBytes)),
+		execOpts:    b.execOpts,
+	}
+}
+
 func (b LocalQueryBuilder) Execute(ctx context.Context, callback func(ctx context.Context, r arrow.Record) error) error {
 	ctx, span := b.tracer.Start(ctx, "LocalQueryBuilder/Execute")
 	defer span.End()
@@ -155,7 +181,7 @@ func (b LocalQueryBuilder) buildPhysical(ctx context.Context) (*physicalplan.Out
 		return nil, err
 	}
 
-	for _, optimizer := range logicalplan.DefaultOptimizers {
+	for _, optimizer := range logicalplan.DefaultOptimizers() {
 		logicalPlan = optimizer.Optimize(logicalPlan)
 	}
 

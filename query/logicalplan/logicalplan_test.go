@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/stretchr/testify/require"
 
 	"github.com/polarsignals/frostdb/dynparquet"
@@ -18,26 +18,26 @@ func (m *mockTableReader) Schema() *dynparquet.Schema {
 	return m.schema
 }
 
-func (m *mockTableReader) View(ctx context.Context, fn func(ctx context.Context, tx uint64) error) error {
+func (m *mockTableReader) View(_ context.Context, _ func(ctx context.Context, tx uint64) error) error {
 	return nil
 }
 
 func (m *mockTableReader) Iterator(
-	ctx context.Context,
-	tx uint64,
-	pool memory.Allocator,
-	callbacks []Callback,
-	iterOpts ...Option,
+	_ context.Context,
+	_ uint64,
+	_ memory.Allocator,
+	_ []Callback,
+	_ ...Option,
 ) error {
 	return nil
 }
 
 func (m *mockTableReader) SchemaIterator(
-	ctx context.Context,
-	tx uint64,
-	pool memory.Allocator,
-	callbacks []Callback,
-	iterOpts ...Option,
+	_ context.Context,
+	_ uint64,
+	_ memory.Allocator,
+	_ []Callback,
+	_ ...Option,
 ) error {
 	return nil
 }
@@ -46,7 +46,7 @@ type mockTableProvider struct {
 	schema *dynparquet.Schema
 }
 
-func (m *mockTableProvider) GetTable(name string) (TableReader, error) {
+func (m *mockTableProvider) GetTable(_ string) (TableReader, error) {
 	return &mockTableReader{
 		schema: m.schema,
 	}, nil
@@ -56,38 +56,25 @@ func TestInputSchemaGetter(t *testing.T) {
 	schema := dynparquet.NewSampleSchema()
 
 	// test we can get the table by traversing to find the TableScan
-	plan, _ := (&Builder{}).
+	plan, err := (&Builder{}).
 		Scan(&mockTableProvider{schema}, "table1").
 		Filter(Col("labels.test").Eq(Literal("abc"))).
 		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
+			[]*AggregationFunction{Sum(Col("value"))},
 			[]Expr{Col("stacktrace")},
 		).
-		Project(Col("stacktrace")).
+		Project(Col("stacktrace"), Sum(Col("value")).Alias("value_sum")).
 		Build()
+	require.NoError(t, err)
 	require.Equal(t, schema, plan.InputSchema())
+}
 
-	// test we can get the table by traversing to find SchemaScan
-	plan, _ = (&Builder{}).
-		ScanSchema(&mockTableProvider{schema}, "table1").
-		Filter(Col("labels.test").Eq(Literal("abc"))).
-		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
-			[]Expr{Col("stacktrace")},
-		).
-		Project(Col("stacktrace")).
-		Build()
-	require.Equal(t, schema, plan.InputSchema())
+func Test_ExprClone(t *testing.T) {
+	expr := Col("labels.test").Eq(Literal("abc"))
+	expr2 := expr.Clone()
+	require.Equal(t, expr, expr2)
 
-	// test it returns null in case where we built a logical plan w/ no
-	// TableScan or SchemaScan
-	plan, _ = (&Builder{}).
-		Filter(Col("labels.test").Eq(Literal("abc"))).
-		Aggregate(
-			[]Expr{Sum(Col("value")).Alias("value_sum")},
-			[]Expr{Col("stacktrace")},
-		).
-		Project(Col("stacktrace")).
-		Build()
-	require.Nil(t, plan.InputSchema())
+	// Modify the original expr and make sure the clone is not affected
+	expr.Op = OpGt
+	require.NotEqual(t, expr, expr2)
 }

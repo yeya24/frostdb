@@ -6,11 +6,12 @@ import (
 	"io"
 	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
-	"github.com/segmentio/parquet-go"
+	"github.com/parquet-go/parquet-go"
 	"github.com/stretchr/testify/require"
+
+	schemapb "github.com/polarsignals/frostdb/gen/proto/go/frostdb/schema/v1alpha1"
 )
 
 func TestMergeRowBatches(t *testing.T) {
@@ -20,12 +21,11 @@ func TestMergeRowBatches(t *testing.T) {
 	rowGroups := []DynamicRowGroup{}
 	for _, sample := range samples {
 		s := Samples{sample}
-		rg, err := s.ToBuffer(schema)
+		rg, err := ToBuffer(s, schema)
 		require.NoError(t, err)
 		rowGroups = append(rowGroups, rg)
 	}
 
-	rand.Seed(time.Now().UnixNano())
 	rand.Shuffle(len(rowGroups), func(i, j int) { rowGroups[i], rowGroups[j] = rowGroups[j], rowGroups[i] })
 
 	merge, err := schema.MergeDynamicRowGroups(rowGroups)
@@ -162,9 +162,9 @@ func TestMultipleIterations(t *testing.T) {
 	schema := NewSampleSchema()
 
 	samples := Samples{{
-		Labels: []Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -173,10 +173,10 @@ func TestMultipleIterations(t *testing.T) {
 		Timestamp: 1,
 		Value:     1,
 	}, {
-		Labels: []Label{
-			{Name: "label1", Value: "value2"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -185,10 +185,10 @@ func TestMultipleIterations(t *testing.T) {
 		Timestamp: 2,
 		Value:     2,
 	}, {
-		Labels: []Label{
-			{Name: "label1", Value: "value3"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label4", Value: "value4"},
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -198,7 +198,7 @@ func TestMultipleIterations(t *testing.T) {
 		Value:     3,
 	}}
 
-	dbuf, err := samples.ToBuffer(schema)
+	dbuf, err := ToBuffer(samples, schema)
 	require.NoError(t, err)
 
 	buf := dbuf.buffer
@@ -235,9 +235,9 @@ func Test_SchemaFromParquetFile(t *testing.T) {
 	schema := NewSampleSchema()
 
 	samples := Samples{{
-		Labels: []Label{
-			{Name: "label1", Value: "value1"},
-			{Name: "label2", Value: "value2"},
+		Labels: map[string]string{
+			"label1": "value1",
+			"label2": "value2",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -246,10 +246,10 @@ func Test_SchemaFromParquetFile(t *testing.T) {
 		Timestamp: 1,
 		Value:     1,
 	}, {
-		Labels: []Label{
-			{Name: "label1", Value: "value2"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label3", Value: "value3"},
+		Labels: map[string]string{
+			"label1": "value2",
+			"label2": "value2",
+			"label3": "value3",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -258,10 +258,10 @@ func Test_SchemaFromParquetFile(t *testing.T) {
 		Timestamp: 2,
 		Value:     2,
 	}, {
-		Labels: []Label{
-			{Name: "label1", Value: "value3"},
-			{Name: "label2", Value: "value2"},
-			{Name: "label4", Value: "value4"},
+		Labels: map[string]string{
+			"label1": "value3",
+			"label2": "value2",
+			"label4": "value4",
 		},
 		Stacktrace: []uuid.UUID{
 			{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
@@ -271,7 +271,7 @@ func Test_SchemaFromParquetFile(t *testing.T) {
 		Value:     3,
 	}}
 
-	dbuf, err := samples.ToBuffer(schema)
+	dbuf, err := ToBuffer(samples, schema)
 	require.NoError(t, err)
 
 	b := bytes.NewBuffer(nil)
@@ -283,4 +283,113 @@ func Test_SchemaFromParquetFile(t *testing.T) {
 	def, err := DefinitionFromParquetFile(file)
 	require.NoError(t, err)
 	require.Equal(t, SampleDefinition(), def)
+}
+
+func TestIsDynamicColumn(t *testing.T) {
+	for _, tc := range []struct {
+		input      string
+		cName      string
+		notDynamic bool
+		expected   bool
+	}{
+		{
+			input:    "labels.label1",
+			cName:    "labels",
+			expected: true,
+		},
+		{
+			input:    "labels.label1.cannothavetwoperiods",
+			cName:    "labels",
+			expected: false,
+		},
+		{
+			input:    "columnnotfound.label1",
+			cName:    "labels",
+			expected: false,
+		},
+		{
+			input:      "labels.columnnotdynamic",
+			cName:      "labels",
+			notDynamic: true,
+			expected:   false,
+		},
+		{
+			input:    "",
+			cName:    "labels",
+			expected: false,
+		},
+	} {
+		def := &schemapb.Schema{
+			Name: "test_schema",
+			Columns: []*schemapb.Column{{
+				Name: tc.cName,
+				StorageLayout: &schemapb.StorageLayout{
+					Type:     schemapb.StorageLayout_TYPE_INT64,
+					Encoding: schemapb.StorageLayout_ENCODING_PLAIN_UNSPECIFIED,
+				},
+				Dynamic: !tc.notDynamic,
+			}},
+		}
+		schema, err := SchemaFromDefinition(def)
+		require.NoError(t, err)
+		schema.FindDynamicColumnForConcreteColumn(tc.cName)
+	}
+}
+
+func BenchmarkIsDynamicColumn(b *testing.B) {
+	def := &schemapb.Schema{
+		Name: "test_schema",
+		Columns: []*schemapb.Column{{
+			Name: "labels",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_INT64,
+				Encoding: schemapb.StorageLayout_ENCODING_PLAIN_UNSPECIFIED,
+			},
+			Dynamic: true,
+		}},
+	}
+	schema, err := SchemaFromDefinition(def)
+	require.NoError(b, err)
+	for i := 0; i < b.N; i++ {
+		schema.FindDynamicColumnForConcreteColumn("labels.label1")
+	}
+}
+
+func TestMergeDynamicColumnSets(t *testing.T) {
+	sets := []map[string][]string{
+		{"labels": {"label1", "label2"}},
+		{"labels": {"label1", "label2"}},
+		{"labels": {"label1", "label2", "label3"}},
+		{
+			"labels": {"label1", "label2"},
+			"foo":    {"label1", "label2"},
+		},
+		{
+			"labels": {"label1", "label2", "label3"},
+			"foo":    {"label1", "label2", "label3"},
+		},
+	}
+	require.Equal(t, map[string][]string{
+		"foo":    {"label1", "label2", "label3"},
+		"labels": {"label1", "label2", "label3"},
+	}, MergeDynamicColumnSets(sets))
+}
+
+func BenchmarkMergeDynamicColumnSets(b *testing.B) {
+	sets := []map[string][]string{
+		{"labels": {"label1", "label2"}},
+		{"labels": {"label1", "label2"}},
+		{"labels": {"label1", "label2", "label3"}},
+		{
+			"labels": {"label1", "label2"},
+			"foo":    {"label1", "label2"},
+		},
+		{
+			"labels": {"label1", "label2", "label3"},
+			"foo":    {"label1", "label2", "label3"},
+		},
+	}
+	for i := 0; i < b.N; i++ {
+		MergeDynamicColumnSets(sets)
+	}
 }

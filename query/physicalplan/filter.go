@@ -7,10 +7,10 @@ import (
 	"regexp"
 
 	"github.com/RoaringBitmap/roaring"
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
-	"github.com/apache/arrow/go/v10/arrow/scalar"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/scalar"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/polarsignals/frostdb/query/logicalplan"
@@ -53,13 +53,30 @@ func (f PreExprVisitorFunc) PreVisit(expr logicalplan.Expr) bool {
 	return f(expr)
 }
 
-func (f PreExprVisitorFunc) PostVisit(expr logicalplan.Expr) bool {
+func (f PreExprVisitorFunc) Visit(_ logicalplan.Expr) bool {
+	return false
+}
+
+func (f PreExprVisitorFunc) PostVisit(_ logicalplan.Expr) bool {
 	return false
 }
 
 func binaryBooleanExpr(expr *logicalplan.BinaryExpr) (BooleanExpression, error) {
 	switch expr.Op {
-	case logicalplan.OpEq, logicalplan.OpNotEq, logicalplan.OpLt, logicalplan.OpLtEq, logicalplan.OpGt, logicalplan.OpGtEq, logicalplan.OpRegexMatch, logicalplan.OpRegexNotMatch:
+	case logicalplan.OpEq,
+		logicalplan.OpNotEq,
+		logicalplan.OpLt,
+		logicalplan.OpLtEq,
+		logicalplan.OpGt,
+		logicalplan.OpGtEq,
+		logicalplan.OpRegexMatch,
+		logicalplan.OpRegexNotMatch,
+		logicalplan.OpAdd,
+		logicalplan.OpSub,
+		logicalplan.OpMul,
+		logicalplan.OpDiv,
+		logicalplan.OpContains,
+		logicalplan.OpNotContains:
 		var leftColumnRef *ArrayRef
 		expr.Left.Accept(PreExprVisitorFunc(func(expr logicalplan.Expr) bool {
 			switch e := expr.(type) {
@@ -115,12 +132,12 @@ func binaryBooleanExpr(expr *logicalplan.BinaryExpr) (BooleanExpression, error) 
 	case logicalplan.OpAnd:
 		left, err := booleanExpr(expr.Left)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("left bool expr: %w", err)
 		}
 
 		right, err := booleanExpr(expr.Right)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("right bool expr: %w", err)
 		}
 
 		return &AndExpr{
@@ -130,12 +147,12 @@ func binaryBooleanExpr(expr *logicalplan.BinaryExpr) (BooleanExpression, error) 
 	case logicalplan.OpOr:
 		left, err := booleanExpr(expr.Left)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("left bool expr: %w", err)
 		}
 
 		right, err := booleanExpr(expr.Right)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("right bool expr: %w", err)
 		}
 
 		return &OrExpr{
@@ -143,7 +160,7 @@ func binaryBooleanExpr(expr *logicalplan.BinaryExpr) (BooleanExpression, error) 
 			Right: right,
 		}, nil
 	default:
-		panic("unsupported binary boolean expression")
+		return nil, fmt.Errorf("binary expr %s: %w", expr.Op.String(), ErrUnsupportedBooleanExpression)
 	}
 }
 
@@ -156,6 +173,10 @@ func (a *AndExpr) Eval(r arrow.Record) (*Bitmap, error) {
 	left, err := a.Left.Eval(r)
 	if err != nil {
 		return nil, err
+	}
+
+	if left.IsEmpty() {
+		return left, nil
 	}
 
 	right, err := a.Right.Eval(r)
@@ -209,7 +230,7 @@ func booleanExpr(expr logicalplan.Expr) (BooleanExpression, error) {
 func Filter(pool memory.Allocator, tracer trace.Tracer, filterExpr logicalplan.Expr) (*PredicateFilter, error) {
 	expr, err := booleanExpr(filterExpr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create bool expr: %w", err)
 	}
 
 	return newFilter(pool, tracer, expr), nil
@@ -225,6 +246,10 @@ func newFilter(pool memory.Allocator, tracer trace.Tracer, filterExpr BooleanExp
 
 func (f *PredicateFilter) SetNext(next PhysicalPlan) {
 	f.next = next
+}
+
+func (f *PredicateFilter) Close() {
+	f.next.Close()
 }
 
 func (f *PredicateFilter) Callback(ctx context.Context, r arrow.Record) error {
@@ -263,23 +288,35 @@ func filter(pool memory.Allocator, filterExpr BooleanExpression, ar arrow.Record
 
 	totalRows := int64(0)
 	recordRanges := make([]arrow.Record, len(ranges))
+	defer func() {
+		for _, r := range recordRanges {
+			r.Release()
+		}
+	}()
 	for j, r := range ranges {
 		recordRanges[j] = ar.NewSlice(int64(r.Start), int64(r.End))
 		totalRows += int64(r.End - r.Start)
 	}
 
-	cols := make([]arrow.Array, ar.NumCols())
+	cols := make([]arrow.Array, 0, ar.NumCols())
+	defer func() {
+		for _, col := range cols {
+			col.Release()
+		}
+	}()
 	numRanges := len(recordRanges)
-	for i := range cols {
+	for i := range ar.Columns() {
 		colRanges := make([]arrow.Array, 0, numRanges)
 		for _, rr := range recordRanges {
 			colRanges = append(colRanges, rr.Column(i))
 		}
 
-		cols[i], err = array.Concatenate(colRanges, pool)
+		c, err := array.Concatenate(colRanges, pool)
 		if err != nil {
 			return nil, true, err
 		}
+
+		cols = append(cols, c)
 	}
 
 	return array.NewRecord(ar.Schema(), cols, totalRows), false, nil

@@ -2,15 +2,16 @@ package pqarrow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
 	"sync"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
-	"github.com/segmentio/parquet-go"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/parquet-go/parquet-go"
 
 	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/pqarrow/builder"
@@ -20,11 +21,11 @@ import (
 )
 
 // ParquetRowGroupToArrowSchema converts a parquet row group to an arrow schema.
-func ParquetRowGroupToArrowSchema(ctx context.Context, rg parquet.RowGroup, options logicalplan.IterOptions) (*arrow.Schema, error) {
-	return ParquetSchemaToArrowSchema(ctx, rg.Schema(), options)
+func ParquetRowGroupToArrowSchema(ctx context.Context, rg parquet.RowGroup, s *dynparquet.Schema, options logicalplan.IterOptions) (*arrow.Schema, error) {
+	return ParquetSchemaToArrowSchema(ctx, rg.Schema(), s, options)
 }
 
-func ParquetSchemaToArrowSchema(ctx context.Context, schema *parquet.Schema, options logicalplan.IterOptions) (*arrow.Schema, error) {
+func ParquetSchemaToArrowSchema(ctx context.Context, schema *parquet.Schema, s *dynparquet.Schema, options logicalplan.IterOptions) (*arrow.Schema, error) {
 	parquetFields := schema.Fields()
 
 	if len(options.DistinctColumns) == 1 && options.Filter == nil {
@@ -59,21 +60,47 @@ func ParquetSchemaToArrowSchema(ctx context.Context, schema *parquet.Schema, opt
 		}
 	}
 
-	for _, distinctExpr := range options.DistinctColumns {
-		if distinctExpr.Computed() {
-			dataType, err := distinctExpr.DataType(schema)
-			if err != nil {
-				return nil, err
+	if len(options.DistinctColumns) > 0 {
+		for _, distinctExpr := range options.DistinctColumns {
+			if distinctExpr.Computed() {
+				// Usually we would pass the logical query plan as the data type
+				// finder, but we're here because of an intended layering
+				// violation, which is pushing distinct queries down to the scan
+				// layer. In this case there are no other possible physical types
+				// other than the actual schema, so we can just implement a
+				// simplified version of the type finder that doesn't need to
+				// traverse the logical plan, since this is already the physical
+				// scan layer execution.
+				dataType, err := distinctExpr.DataType(&exprTypeFinder{s: s})
+				if err != nil {
+					return nil, err
+				}
+				fields = append(fields, arrow.Field{
+					Name:     distinctExpr.Name(),
+					Type:     dataType,
+					Nullable: true, // TODO: This should be determined by the expression and underlying column(s).
+				})
 			}
-			fields = append(fields, arrow.Field{
-				Name:     distinctExpr.Name(),
-				Type:     dataType,
-				Nullable: true, // TODO: This should be determined by the expression and underlying column(s).
-			})
 		}
+
+		// Need to sort as the distinct columns are just appended, but we need
+		// the schema to be sorted. If we didn't sort them here, then
+		// subsequent schemas would be in a different order as
+		// `mergeArrowSchemas` sorts fields by name.
+		sort.Slice(fields, func(i, j int) bool {
+			return fields[i].Name < fields[j].Name
+		})
 	}
 
 	return arrow.NewSchema(fields, nil), nil
+}
+
+type exprTypeFinder struct {
+	s *dynparquet.Schema
+}
+
+func (e *exprTypeFinder) DataTypeForExpr(expr logicalplan.Expr) (arrow.DataType, error) {
+	return logicalplan.DataTypeForExprWithSchema(expr, e.s)
 }
 
 func parquetFieldToArrowField(prefix string, field parquet.Field, physicalProjections []logicalplan.Expr) (arrow.Field, error) {
@@ -234,13 +261,13 @@ func NewParquetConverter(
 	return c
 }
 
-func (c *ParquetConverter) Convert(ctx context.Context, rg parquet.RowGroup) error {
-	schema, err := ParquetRowGroupToArrowSchema(ctx, rg, c.iterOpts)
+func (c *ParquetConverter) Convert(ctx context.Context, rg parquet.RowGroup, s *dynparquet.Schema) error {
+	schema, err := ParquetRowGroupToArrowSchema(ctx, rg, s, c.iterOpts)
 	if err != nil {
 		return err
 	}
 	// If the schema has no fields we simply ignore this RowGroup that has no data.
-	if len(schema.Fields()) == 0 {
+	if schema.NumFields() == 0 {
 		return nil
 	}
 
@@ -270,7 +297,7 @@ func (c *ParquetConverter) Convert(ctx context.Context, rg parquet.RowGroup) err
 	}
 
 	if _, ok := rg.(*dynparquet.MergedRowGroup); ok {
-		return rowBasedParquetRowGroupToArrowRecord(ctx, c.pool, rg, c.outputSchema, c.builder)
+		return rowBasedParquetRowGroupToArrowRecord(ctx, rg, c.outputSchema, c.builder)
 	}
 
 	parquetSchema := rg.Schema()
@@ -363,6 +390,12 @@ func (c *ParquetConverter) NewRecord() arrow.Record {
 	}
 
 	return nil
+}
+
+func (c *ParquetConverter) Reset() {
+	if c.builder != nil {
+		c.builder.Reset()
+	}
 }
 
 func (c *ParquetConverter) Close() {
@@ -608,14 +641,13 @@ var rowBufPool = &sync.Pool{
 // record row by row. The result is appended to b.
 func rowBasedParquetRowGroupToArrowRecord(
 	ctx context.Context,
-	pool memory.Allocator,
 	rg parquet.RowGroup,
 	schema *arrow.Schema,
 	builder *builder.RecordBuilder,
 ) error {
 	parquetFields := rg.Schema().Fields()
 
-	if len(schema.Fields()) != len(parquetFields) {
+	if schema.NumFields() != len(parquetFields) {
 		return fmt.Errorf("inconsistent schema between arrow and parquet")
 	}
 
@@ -690,7 +722,10 @@ func (c *ParquetConverter) writeColumnToArray(
 		// the index values.
 		// TODO(asubiotto): This optimization can be applied at a finer
 		// granularity at the page level as well.
-		columnIndex := columnChunk.ColumnIndex()
+		columnIndex, err := columnChunk.ColumnIndex()
+		if err != nil {
+			return err
+		}
 		columnType := columnChunk.Type()
 
 		globalMinValue := columnIndex.MinValue(0)
@@ -746,36 +781,42 @@ func (c *ParquetConverter) writeColumnToArray(
 			}
 			return fmt.Errorf("read page: %w", err)
 		}
-		dict := p.Dictionary()
 
-		switch {
-		case !repeated && dictionaryOnly && dict != nil && p.NumNulls() == 0:
-			// If we are only writing the dictionary, we don't need to read
-			// the values.
-			if err := w.WritePage(dict.Page()); err != nil {
-				return fmt.Errorf("write dictionary page: %w", err)
+		dict := p.Dictionary()
+		if dict != nil && dictionaryOnly {
+			// We only want distinct values; write only the dictionary page.
+			if p.NumNulls() > 0 {
+				// Since dictionary pages do not represent nulls, write a null
+				// value if the non-dictionary page has at least one null.
+				w.Write([]parquet.Value{parquet.NullValue()})
 			}
-		case !repeated && p.NumNulls() == 0 && dict == nil:
-			// If the column has no nulls, we can read all values at once
-			// consecutively without worrying about null values.
-			if err := w.WritePage(p); err != nil {
+			p = dict.Page()
+		}
+
+		if pw, ok := w.(writer.PageWriter); ok {
+			err := pw.WritePage(p)
+			if err == nil {
+				continue
+			} else if err != nil && !errors.Is(err, writer.ErrCannotWritePageDirectly) {
 				return fmt.Errorf("write page: %w", err)
 			}
-		default:
-			if n := p.NumValues(); int64(cap(c.scratchValues)) < n {
-				c.scratchValues = make([]parquet.Value, n)
-			} else {
-				c.scratchValues = c.scratchValues[:n]
-			}
-
-			// We're reading all values in the page so we always expect an io.EOF.
-			reader := p.Values()
-			if _, err := reader.ReadValues(c.scratchValues); err != nil && err != io.EOF {
-				return fmt.Errorf("read values: %w", err)
-			}
-
-			w.Write(c.scratchValues)
+			// Could not write page directly, fall through to slow path.
 		}
+
+		// Write values using the slow path.
+		n := p.NumValues()
+		if int64(cap(c.scratchValues)) < n {
+			c.scratchValues = make([]parquet.Value, n)
+		}
+		c.scratchValues = c.scratchValues[:n]
+
+		// We're reading all values in the page so we always expect an io.EOF.
+		reader := p.Values()
+		if _, err := reader.ReadValues(c.scratchValues); err != nil && err != io.EOF {
+			return fmt.Errorf("read values: %w", err)
+		}
+
+		w.Write(c.scratchValues)
 	}
 
 	return nil
@@ -852,7 +893,11 @@ func (f PreExprVisitorFunc) PreVisit(expr logicalplan.Expr) bool {
 	return f(expr)
 }
 
-func (f PreExprVisitorFunc) PostVisit(expr logicalplan.Expr) bool {
+func (f PreExprVisitorFunc) Visit(_ logicalplan.Expr) bool {
+	return false
+}
+
+func (f PreExprVisitorFunc) PostVisit(_ logicalplan.Expr) bool {
 	return false
 }
 
@@ -887,7 +932,10 @@ func binaryDistinctExpr(
 	value := *info.v
 	switch expr.Op {
 	case logicalplan.OpGt:
-		index := columnChunk.ColumnIndex()
+		index, err := columnChunk.ColumnIndex()
+		if err != nil {
+			return false, err
+		}
 		allGreater, noneGreater := allOrNoneGreaterThan(
 			typ,
 			index,
@@ -920,14 +968,14 @@ func allOrNoneGreaterThan(
 	allTrue := true
 	allFalse := true
 	for i := 0; i < numPages; i++ {
-		min := index.MinValue(i)
-		max := index.MaxValue(i)
+		minValue := index.MinValue(i)
+		maxValue := index.MaxValue(i)
 
-		if typ.Compare(max, value) <= 0 {
+		if typ.Compare(maxValue, value) <= 0 {
 			allTrue = false
 		}
 
-		if typ.Compare(min, value) > 0 {
+		if typ.Compare(minValue, value) > 0 {
 			allFalse = false
 		}
 	}
@@ -978,6 +1026,17 @@ func copyArrToBuilder(builder builder.ColumnBuilder, arr arrow.Array, toCopy int
 				b.Append(arr.Value(i))
 			}
 		}
+	case *array.String:
+		b := builder.(*array.BinaryBuilder)
+		for i := 0; i < toCopy; i++ {
+			if arr.IsNull(i) {
+				// We cannot use unsafe appends with the binary builder
+				// because offsets won't be appended.
+				b.AppendNull()
+			} else {
+				b.AppendString(arr.Value(i))
+			}
+		}
 	case *array.Int64:
 		b := builder.(*array.Int64Builder)
 		for i := 0; i < toCopy; i++ {
@@ -1014,6 +1073,16 @@ func copyArrToBuilder(builder builder.ColumnBuilder, arr arrow.Array, toCopy int
 					b.AppendNull()
 				} else {
 					if err := b.Append(dict.Value(arr.GetValueIndex(i))); err != nil {
+						panic("failed to append to dictionary")
+					}
+				}
+			}
+		case *array.String:
+			for i := 0; i < toCopy; i++ {
+				if arr.IsNull(i) {
+					b.AppendNull()
+				} else {
+					if err := b.AppendString(dict.Value(arr.GetValueIndex(i))); err != nil {
 						panic("failed to append to dictionary")
 					}
 				}
@@ -1147,7 +1216,8 @@ func mergeArrowSchemas(schemas []*arrow.Schema) *arrow.Schema {
 	fieldsMap := make(map[string]arrow.Field)
 
 	for _, schema := range schemas {
-		for _, f := range schema.Fields() {
+		for i := 0; i < schema.NumFields(); i++ {
+			f := schema.Field(i)
 			if _, ok := fieldsMap[f.Name]; !ok {
 				fieldNames = append(fieldNames, f.Name)
 				fieldsMap[f.Name] = f
@@ -1181,4 +1251,32 @@ func ColToWriter(col int, writers []MultiColumnWriter) writer.ValueWriter {
 	}
 
 	return nil
+}
+
+// Project will project the record according to the given projections.
+func Project(r arrow.Record, projections []logicalplan.Expr) arrow.Record {
+	if len(projections) == 0 {
+		r.Retain() // NOTE: we're creating another reference to this record, so retain it
+		return r
+	}
+
+	cols := make([]arrow.Array, 0, r.Schema().NumFields())
+	fields := make([]arrow.Field, 0, r.Schema().NumFields())
+	for i := 0; i < r.Schema().NumFields(); i++ {
+		for _, projection := range projections {
+			if projection.MatchColumn(r.Schema().Field(i).Name) {
+				cols = append(cols, r.Column(i))
+				fields = append(fields, r.Schema().Field(i))
+				break
+			}
+		}
+	}
+
+	// If the projection matches the entire record, return the record as is.
+	if len(cols) == r.Schema().NumFields() {
+		r.Retain() // NOTE: we're creating another reference to this record, so retain it
+		return r
+	}
+
+	return array.NewRecord(arrow.NewSchema(fields, nil), cols, r.NumRows())
 }

@@ -1,8 +1,8 @@
 package arrowutils
 
 import (
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 
 	"github.com/polarsignals/frostdb/pqarrow/builder"
 )
@@ -17,21 +17,22 @@ type VirtualNullArray struct {
 	len int
 }
 
-func MakeVirtualNullArray(dt arrow.DataType, len int) VirtualNullArray {
+func MakeVirtualNullArray(dt arrow.DataType, length int) VirtualNullArray {
 	return VirtualNullArray{
 		dt:  dt,
-		len: len,
+		len: length,
 	}
 }
 
 // MakeNullArray makes a physical arrow.Array full of NULLs of the given
 // DataType.
-func MakeNullArray(mem memory.Allocator, dt arrow.DataType, len int) arrow.Array {
+func MakeNullArray(mem memory.Allocator, dt arrow.DataType, length int) arrow.Array {
 	// TODO(asubiotto): This can be improved by using the optimized builders'
 	// AppendNulls. Not sure whether this should be part of the builder package.
 	b := builder.NewBuilder(mem, dt)
-	b.Reserve(len)
-	for i := 0; i < len; i++ {
+	defer b.Release()
+	b.Reserve(length)
+	for i := 0; i < length; i++ {
 		b.AppendNull()
 	}
 	return b.NewArray()
@@ -74,3 +75,7 @@ func (n VirtualNullArray) Retain() {}
 func (n VirtualNullArray) Release() {}
 
 func (n VirtualNullArray) String() string { return "VirtualNullArray" }
+
+func (n VirtualNullArray) ValueStr(_ int) string { return "" }
+
+func (n VirtualNullArray) GetOneForMarshal(_ int) any { return nil }

@@ -6,6 +6,7 @@ import "frostdb/table/v1alpha1/config.proto";
 
 // Record describes a single entry into the WAL.
 message Record {
+  reserved 2; // Previously used for transaction metadata.
   // Data of the record. This is intentionally nested so the only thing in
   // the entry can be a protobuf `oneof` and have forward compatilibity.
   Entry entry = 1;
@@ -41,8 +42,14 @@ message Entry {
     string table_name = 1;
     // Block ID of the new-table-block.
     bytes block_id = 2;
+    // NextTx is the next non-persisted transaction at the time of block
+    // persistence. If the block has been persisted, any txn id < next_tx is
+    // considered persisted or not relevant to this table (i.e. it can be a
+    // non-persisted txn from another table).
+    uint64 next_tx = 3;
   }
 
+  // The snapshot entry.
   message Snapshot {
     // The tx the snapshot was taken at.
     uint64 tx = 1;

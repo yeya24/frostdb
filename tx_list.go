@@ -56,12 +56,10 @@ func NewTxPool(watermark *atomic.Uint64) *TxPool {
 	tail := &TxNode{
 		next:     &atomic.Pointer[TxNode]{},
 		original: &atomic.Pointer[TxNode]{},
-		tx:       0,
 	}
 	head := &TxNode{
 		next:     &atomic.Pointer[TxNode]{},
 		original: &atomic.Pointer[TxNode]{},
-		tx:       0,
 	}
 	txpool := &TxPool{
 		head:  &atomic.Pointer[TxNode]{},
@@ -109,6 +107,8 @@ func (l *TxPool) Insert(tx uint64) {
 		return false
 	}
 	for !tryInsert() {
+		// Satisfy linter with statement.
+		continue
 	}
 }
 
@@ -125,7 +125,16 @@ func (l *TxPool) insert(node, prev, next *TxNode) bool {
 	return success
 }
 
-func (l *TxPool) Iterate(iterate func(tx uint64) bool) {
+// notifyWatermark notifies the TxPool that the watermark has been updated. This
+// triggers a sweep of the pool.
+func (l *TxPool) notifyWatermark() {
+	select {
+	case l.drain <- struct{}{}:
+	default:
+	}
+}
+
+func (l *TxPool) Iterate(iterate func(txn uint64) bool) {
 	for node := l.head.Load().next.Load(); node.tx != 0; node = getUnmarked(node) {
 		if isMarked(node) == nil && !iterate(node.tx) {
 			return
@@ -134,7 +143,7 @@ func (l *TxPool) Iterate(iterate func(tx uint64) bool) {
 }
 
 // delete iterates over the list and deletes until the delete function returns false.
-func (l *TxPool) delete(deleteFunc func(tx uint64) bool) {
+func (l *TxPool) delete(deleteFunc func(txn uint64) bool) {
 	for node := l.head.Load().next.Load(); node.tx != 0; node = getUnmarked(node) {
 		if !deleteFunc(node.tx) {
 			return
@@ -163,7 +172,7 @@ func isMarked(node *TxNode) *TxNode {
 	return og
 }
 
-func getMarked(node *TxNode) *TxNode {
+func getMarked(_ *TxNode) *TxNode {
 	// using nil as the marker
 	return nil
 }
@@ -190,13 +199,13 @@ func (l *TxPool) cleaner(ctx context.Context, watermark *atomic.Uint64) {
 		case <-ctx.Done():
 			return
 		case <-l.drain:
-			l.delete(func(tx uint64) bool {
+			l.delete(func(txn uint64) bool {
 				mark := watermark.Load()
 				switch {
-				case mark+1 == tx:
-					watermark.Add(1)
+				case mark+1 == txn:
+					watermark.Store(txn)
 					return true // return true to indicate that this node should be removed from the tx list.
-				case mark >= tx:
+				case mark >= txn:
 					return true
 				default:
 					return false

@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/cockroachdb/datadriven"
 	"github.com/stretchr/testify/require"
 
@@ -20,6 +20,7 @@ const testdataDirectory = "testdata"
 
 type frostDB struct {
 	*frostdb.DB
+	allocator *memory.CheckedAllocator
 }
 
 func (db frostDB) CreateTable(name string, schema *schemapb.Schema) (Table, error) {
@@ -28,7 +29,7 @@ func (db frostDB) CreateTable(name string, schema *schemapb.Schema) (Table, erro
 
 func (db frostDB) ScanTable(name string) query.Builder {
 	queryEngine := query.NewEngine(
-		memory.NewGoAllocator(),
+		db.allocator,
 		db.DB.TableProvider(),
 		query.WithPhysicalplanOptions(
 			physicalplan.WithOrderedAggregations(),
@@ -38,7 +39,7 @@ func (db frostDB) ScanTable(name string) query.Builder {
 }
 
 var schemas = map[string]*schemapb.Schema{
-	"default": dynparquet.SampleDefinition(),
+	"default": dynparquet.SampleDefinitionWithFloat(),
 	"simple_bool": {
 		Name: "simple_bool",
 		Columns: []*schemapb.Column{{
@@ -55,6 +56,91 @@ var schemas = map[string]*schemapb.Schema{
 		}},
 		SortingColumns: []*schemapb.SortingColumn{{
 			Name:      "found",
+			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
+		}},
+	},
+	"prehashed": {
+		Name: "test",
+		Columns: []*schemapb.Column{{
+			Name: "labels",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_STRING,
+				Nullable: true,
+				Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
+			},
+			Dynamic: true,
+			Prehash: true,
+		}, {
+			Name: "stacktrace",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_STRING,
+				Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
+			},
+			Dynamic: false,
+			Prehash: true,
+		}, {
+			Name: "timestamp",
+			StorageLayout: &schemapb.StorageLayout{
+				Type: schemapb.StorageLayout_TYPE_INT64,
+			},
+			Dynamic: false,
+		}, {
+			Name: "value",
+			StorageLayout: &schemapb.StorageLayout{
+				Type: schemapb.StorageLayout_TYPE_INT64,
+			},
+			Dynamic: false,
+		}},
+		SortingColumns: []*schemapb.SortingColumn{{
+			Name:      "example_type",
+			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
+		}, {
+			Name:       "labels",
+			Direction:  schemapb.SortingColumn_DIRECTION_ASCENDING,
+			NullsFirst: true,
+		}, {
+			Name:      "timestamp",
+			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
+		}, {
+			Name:       "stacktrace",
+			Direction:  schemapb.SortingColumn_DIRECTION_ASCENDING,
+			NullsFirst: true,
+		}},
+	},
+	"bytes": {
+		Name: "test",
+		Columns: []*schemapb.Column{{
+			Name: "labels",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:     schemapb.StorageLayout_TYPE_STRING,
+				Encoding: schemapb.StorageLayout_ENCODING_RLE_DICTIONARY,
+				Nullable: true,
+			},
+			Dynamic: true,
+		}, {
+			Name: "timestamp",
+			StorageLayout: &schemapb.StorageLayout{
+				Type: schemapb.StorageLayout_TYPE_UINT64,
+			},
+			Dynamic: false,
+		}, {
+			Name: "value",
+			StorageLayout: &schemapb.StorageLayout{
+				Type:        schemapb.StorageLayout_TYPE_STRING,
+				Encoding:    schemapb.StorageLayout_ENCODING_DELTA_LENGTH_BYTE_ARRAY,
+				Compression: schemapb.StorageLayout_COMPRESSION_LZ4_RAW,
+			},
+			Dynamic: false,
+		}},
+		SortingColumns: []*schemapb.SortingColumn{{
+			Name:       "labels",
+			Direction:  schemapb.SortingColumn_DIRECTION_ASCENDING,
+			NullsFirst: true,
+		}, {
+			Name:      "timestamp",
+			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
+		}, {
+			Name:      "value",
 			Direction: schemapb.SortingColumn_DIRECTION_ASCENDING,
 		}},
 	},
@@ -78,18 +164,16 @@ func TestLogic(t *testing.T) {
 		defer columnStore.Close()
 		db, err := columnStore.DB(ctx, "test")
 		require.NoError(t, err)
-		r := NewRunner(frostDB{DB: db}, schemas)
-		datadriven.RunTest(t, path, func(t *testing.T, c *datadriven.TestData) string {
+		fdb := frostDB{
+			DB:        db,
+			allocator: memory.NewCheckedAllocator(memory.DefaultAllocator),
+		}
+		r := NewRunner(fdb, schemas)
+		datadriven.RunTest(t, path, func(_ *testing.T, c *datadriven.TestData) string {
 			return r.RunCmd(ctx, c)
 		})
+		if path != "testdata/exec/aggregate/ordered_aggregate" { // NOTE: skip checking the limit for the ordered aggregator as it still leaks memory.
+			fdb.allocator.AssertSize(t, 0)
+		}
 	})
-}
-
-func SchemaMust(def *schemapb.Schema) *dynparquet.Schema {
-	schema, err := dynparquet.SchemaFromDefinition(def)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	return schema
 }

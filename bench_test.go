@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 
 	"github.com/polarsignals/frostdb/dynparquet"
-	"github.com/polarsignals/frostdb/pqarrow/arrowutils"
 	"github.com/polarsignals/frostdb/query"
 	"github.com/polarsignals/frostdb/query/logicalplan"
 )
@@ -38,7 +37,7 @@ const (
 func newDBForBenchmarks(ctx context.Context, b testing.TB) (*ColumnStore, *DB, error) {
 	b.Helper()
 
-	b.Logf("replaying WAL")
+	b.Logf("recovering DB")
 	start := time.Now()
 	col, err := New(
 		WithWAL(),
@@ -47,7 +46,7 @@ func newDBForBenchmarks(ctx context.Context, b testing.TB) (*ColumnStore, *DB, e
 	if err != nil {
 		return nil, nil, err
 	}
-	b.Logf("replayed WAL in %s", time.Since(start))
+	b.Logf("recovered DB in %s", time.Since(start))
 
 	colDB, err := col.DB(ctx, dbName)
 	if err != nil {
@@ -65,7 +64,7 @@ func newDBForBenchmarks(ctx context.Context, b testing.TB) (*ColumnStore, *DB, e
 	}
 	b.Logf("ensured compaction in %s", time.Since(start))
 
-	b.Logf("db initialized and WAL replayed, starting benchmark %s", b.Name())
+	b.Logf("db initialized and recovered, starting benchmark %s", b.Name())
 	return col, colDB, nil
 }
 
@@ -75,12 +74,12 @@ func getLatest15MinInterval(ctx context.Context, b testing.TB, engine *query.Loc
 	var result arrow.Record
 	require.NoError(b, engine.ScanTable(tableName).
 		Aggregate(
-			[]logicalplan.Expr{
+			[]*logicalplan.AggregationFunction{
 				logicalplan.Max(logicalplan.Col("timestamp")),
 			},
 			nil,
 		).Execute(ctx,
-		func(ctx context.Context, r arrow.Record) error {
+		func(_ context.Context, r arrow.Record) error {
 			r.Retain()
 			result = r
 			return nil
@@ -146,20 +145,22 @@ func (t *typesResult) Swap(i, j int) {
 	(*t)[i], (*t)[j] = (*t)[j], (*t)[i]
 }
 
-// getDeterministicTypeFilterExpr will always return a deterministic profile
+// getCPUTypeFilter will always return a deterministic profile
 // type across benchmark runs, as well as a pretty string to print this type.
-func getDeterministicTypeFilterExpr(
+func getCPUTypeFilter(
 	ctx context.Context, engine *query.LocalEngine,
 ) ([]logicalplan.Expr, string, error) {
 	results := make(typesResult, 0)
 	if err := getTypesQuery(engine).Execute(ctx, func(_ context.Context, r arrow.Record) error {
+		nameIdx := r.Schema().FieldIndices("name")[0]
 		for i := 0; i < int(r.NumRows()); i++ {
+			if !strings.Contains(string(r.Column(nameIdx).(*array.Dictionary).GetOneForMarshal(i).([]byte)), "cpu") {
+				// Not a CPU profile type, ignore.
+				continue
+			}
 			row := make([]string, 0, len(typeColumns))
 			for j := range typeColumns {
-				v, err := arrowutils.GetValue(r.Column(j), i)
-				if err != nil {
-					return err
-				}
+				v := r.Column(j).GetOneForMarshal(i)
 				row = append(row, string(v.([]byte)))
 			}
 			results = append(results, row)
@@ -170,7 +171,7 @@ func getDeterministicTypeFilterExpr(
 	}
 
 	if len(results) == 0 {
-		return nil, "", errors.New("no types found")
+		return nil, "", errors.New("no cpu types found")
 	}
 	sort.Sort(&results)
 
@@ -186,7 +187,7 @@ func getDeterministicTypeFilterExpr(
 
 // getDeterministicLabel will always return a deterministic label/value pair
 // across benchmarks.
-func getDeterministicLabelValuePair(ctx context.Context, engine *query.LocalEngine) (string, string, error) {
+func getDeterministicLabelValuePairForType(ctx context.Context, engine *query.LocalEngine, typeFilter []logicalplan.Expr) (string, string, error) {
 	labels := make([]string, 0)
 	if err := getLabelsQuery(engine).Execute(ctx, func(_ context.Context, r arrow.Record) error {
 		arr := r.Column(0)
@@ -200,20 +201,20 @@ func getDeterministicLabelValuePair(ctx context.Context, engine *query.LocalEngi
 	sort.Strings(labels)
 	for _, label := range labels {
 		values := make([]string, 0)
-		if err := getValuesForLabelQuery(engine, label).Execute(ctx, func(ctx context.Context, r arrow.Record) error {
-			arr := r.Column(0)
-			for i := 0; i < arr.Len(); i++ {
-				if arr.IsNull(i) {
-					continue
+		if err := engine.ScanTable(tableName).
+			Filter(logicalplan.And(typeFilter...)).
+			Distinct(logicalplan.Col(label)).
+			Execute(ctx, func(_ context.Context, r arrow.Record) error {
+				arr := r.Column(0)
+				for i := 0; i < arr.Len(); i++ {
+					if arr.IsNull(i) {
+						continue
+					}
+					v := arr.GetOneForMarshal(i)
+					values = append(values, string(v.([]byte)))
 				}
-				v, err := arrowutils.GetValue(arr, i)
-				if err != nil {
-					return err
-				}
-				values = append(values, string(v.([]byte)))
-			}
-			return nil
-		}); err != nil {
+				return nil
+			}); err != nil {
 			return "", "", err
 		}
 		if len(values) == 0 {
@@ -227,7 +228,6 @@ func getDeterministicLabelValuePair(ctx context.Context, engine *query.LocalEngi
 
 func BenchmarkQuery(b *testing.B) {
 	b.Skip(skipReason)
-
 	ctx := context.Background()
 	c, db, err := newDBForBenchmarks(ctx, b)
 	require.NoError(b, err)
@@ -237,14 +237,15 @@ func BenchmarkQuery(b *testing.B) {
 		memory.NewGoAllocator(),
 		db.TableProvider(),
 	)
-	start, end := getLatest15MinInterval(ctx, b, engine)
-	label, value, err := getDeterministicLabelValuePair(ctx, engine)
-	require.NoError(b, err)
-	typeFilter, filterPretty, err := getDeterministicTypeFilterExpr(ctx, engine)
+	typeFilter, filterPretty, err := getCPUTypeFilter(ctx, engine)
 	require.NoError(b, err)
 
-	b.Logf("using label/value pair: (label=%s,value=%s)", label, value)
+	start, end := getLatest15MinInterval(ctx, b, engine)
+	label, value, err := getDeterministicLabelValuePairForType(ctx, engine, typeFilter)
+	require.NoError(b, err)
+
 	b.Logf("using types filter: %s", filterPretty)
+	b.Logf("using label/value pair: (label=%s,value=%s)", label, value)
 
 	fullFilter := append(
 		typeFilter,
@@ -256,7 +257,7 @@ func BenchmarkQuery(b *testing.B) {
 	b.Run("Types", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			if err := getTypesQuery(engine).
-				Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+				Execute(ctx, func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						b.Fatal("expected at least one row")
 					}
@@ -269,7 +270,7 @@ func BenchmarkQuery(b *testing.B) {
 
 	b.Run("Labels", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			if err := getLabelsQuery(engine).Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+			if err := getLabelsQuery(engine).Execute(ctx, func(_ context.Context, r arrow.Record) error {
 				if r.NumRows() == 0 {
 					b.Fatal("expected at least one row")
 				}
@@ -283,7 +284,7 @@ func BenchmarkQuery(b *testing.B) {
 	b.Run("Values", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			if err := getValuesForLabelQuery(engine, label).
-				Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+				Execute(ctx, func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						b.Fatal("expected at least one row")
 					}
@@ -302,14 +303,14 @@ func BenchmarkQuery(b *testing.B) {
 					logicalplan.And(fullFilter...),
 				).
 				Aggregate(
-					[]logicalplan.Expr{
+					[]*logicalplan.AggregationFunction{
 						logicalplan.Sum(logicalplan.Col("value")),
 					},
 					[]logicalplan.Expr{
 						logicalplan.Col("stacktrace"),
 					},
 				).
-				Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+				Execute(ctx, func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						b.Fatal("expected at least one row")
 					}
@@ -328,7 +329,7 @@ func BenchmarkQuery(b *testing.B) {
 					logicalplan.And(fullFilter...),
 				).
 				Aggregate(
-					[]logicalplan.Expr{
+					[]*logicalplan.AggregationFunction{
 						logicalplan.Sum(logicalplan.Col("value")),
 					},
 					[]logicalplan.Expr{
@@ -336,7 +337,7 @@ func BenchmarkQuery(b *testing.B) {
 						logicalplan.Col("timestamp"),
 					},
 				).
-				Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+				Execute(ctx, func(_ context.Context, r arrow.Record) error {
 					if r.NumRows() == 0 {
 						b.Fatal("expected at least one row")
 					}
@@ -345,6 +346,30 @@ func BenchmarkQuery(b *testing.B) {
 				b.Fatalf("query returned error: %v", err)
 			}
 		}
+	})
+
+	// BenchmarkFilter benchmarks performing a simple filter. This is useful to get an idea of our scan speed (minus the
+	// execution engine).
+	b.Run("Filter", func(b *testing.B) {
+		schema := dynparquet.SampleDefinition()
+		table, err := db.Table(tableName, NewTableConfig(schema))
+		require.NoError(b, err)
+		size := table.ActiveBlock().Size()
+		for i := 0; i < b.N; i++ {
+			if err := engine.ScanTable(tableName).
+				Filter(
+					logicalplan.And(fullFilter...),
+				).
+				Execute(ctx, func(_ context.Context, r arrow.Record) error {
+					if r.NumRows() == 0 {
+						b.Fatal("expected at least one row")
+					}
+					return nil
+				}); err != nil {
+				b.Fatalf("query returned error: %v", err)
+			}
+		}
+		b.ReportMetric(float64(size)/(float64(b.Elapsed().Milliseconds())/float64(b.N)), "B/msec")
 	})
 }
 
@@ -363,16 +388,52 @@ func BenchmarkReplay(b *testing.B) {
 	}
 }
 
+type writeCounter struct {
+	io.Writer
+	count int
+}
+
+func (wc *writeCounter) Write(p []byte) (int, error) {
+	count, err := wc.Writer.Write(p)
+	wc.count += count
+	return count, err
+}
+
+func BenchmarkSnapshot(b *testing.B) {
+	b.Skip(skipReason)
+
+	ctx := context.Background()
+	col, err := New(
+		WithWAL(),
+		WithStoragePath(storagePath),
+	)
+	require.NoError(b, err)
+	defer col.Close()
+
+	db, err := col.DB(ctx, dbName)
+	require.NoError(b, err)
+
+	b.Log("recovered DB, starting benchmark")
+
+	b.ResetTimer()
+	bytesWritten := 0
+	for i := 0; i < b.N; i++ {
+		wc := &writeCounter{Writer: io.Discard}
+		require.NoError(b, WriteSnapshot(ctx, db.HighWatermark(), db, wc))
+		bytesWritten += wc.count
+	}
+	b.ReportMetric(float64(bytesWritten)/float64(b.N), "size/op")
+}
+
 func NewTestSamples(num int) dynparquet.Samples {
 	samples := make(dynparquet.Samples, 0, num)
 	for i := 0; i < num; i++ {
 		samples = append(samples,
 			dynparquet.Sample{
 				ExampleType: "cpu",
-				Labels: []dynparquet.Label{{
-					Name:  "node",
-					Value: "test3",
-				}},
+				Labels: map[string]string{
+					"node": "test3",
+				},
 				Stacktrace: []uuid.UUID{
 					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1},
 					{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2},
@@ -401,10 +462,10 @@ func Benchmark_Serialize(b *testing.B) {
 
 	// Insert 10k rows
 	samples := NewTestSamples(10000)
-	buf, err := samples.ToBuffer(tbl.schema)
+	r, err := samples.ToRecord()
 	require.NoError(b, err)
 
-	_, err = tbl.InsertBuffer(ctx, buf)
+	_, err = tbl.InsertRecord(ctx, r)
 	require.NoError(b, err)
 
 	b.ResetTimer()

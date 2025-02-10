@@ -7,12 +7,13 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/array"
-	"github.com/apache/arrow/go/v10/arrow/memory"
-	"github.com/apache/arrow/go/v10/arrow/scalar"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/scalar"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/pqarrow/builder"
 	"github.com/polarsignals/frostdb/query/logicalplan"
 )
@@ -62,6 +63,10 @@ func (d *Distinction) Finish(ctx context.Context) error {
 	return d.next.Finish(ctx)
 }
 
+func (d *Distinction) Close() {
+	d.next.Close()
+}
+
 func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 	// Generates high volume of spans. Comment out if needed during development.
 	// ctx, span := d.tracer.Start(ctx, "Distinction/Callback")
@@ -71,7 +76,8 @@ func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 	distinctFieldHashes := make([]uint64, 0, 10)
 	distinctArrays := make([]arrow.Array, 0, 10)
 
-	for i, field := range r.Schema().Fields() {
+	for i := 0; i < r.Schema().NumFields(); i++ {
+		field := r.Schema().Field(i)
 		for _, col := range d.columns {
 			if col.MatchColumn(field.Name) {
 				distinctFields = append(distinctFields, field)
@@ -82,6 +88,11 @@ func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 	}
 
 	resBuilders := make([]builder.ColumnBuilder, 0, len(distinctArrays))
+	defer func() {
+		for _, builder := range resBuilders {
+			builder.Release()
+		}
+	}()
 	for _, arr := range distinctArrays {
 		resBuilders = append(resBuilders, builder.NewBuilder(d.pool, arr.DataType()))
 	}
@@ -91,7 +102,7 @@ func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 
 	colHashes := make([][]uint64, len(distinctFields))
 	for i, arr := range distinctArrays {
-		colHashes[i] = hashArray(arr)
+		colHashes[i] = dynparquet.HashArray(arr)
 	}
 
 	for i := 0; i < numRows; i++ {
@@ -137,6 +148,11 @@ func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 	}
 
 	resArrays := make([]arrow.Array, 0, len(resBuilders))
+	defer func() {
+		for _, arr := range resArrays {
+			arr.Release()
+		}
+	}()
 	for _, builder := range resBuilders {
 		resArrays = append(resArrays, builder.NewArray())
 	}
@@ -149,7 +165,6 @@ func (d *Distinction) Callback(ctx context.Context, r arrow.Record) error {
 		rows,
 	)
 
-	err := d.next.Callback(ctx, distinctRecord)
-	distinctRecord.Release()
-	return err
+	defer distinctRecord.Release()
+	return d.next.Callback(ctx, distinctRecord)
 }

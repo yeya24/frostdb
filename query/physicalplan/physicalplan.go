@@ -3,16 +3,19 @@ package physicalplan
 import (
 	"context"
 	"fmt"
+	"hash/maphash"
 	"runtime"
 
-	"github.com/apache/arrow/go/v10/arrow"
-	"github.com/apache/arrow/go/v10/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+	"github.com/apache/arrow/go/v17/arrow/scalar"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/polarsignals/frostdb/dynparquet"
 	"github.com/polarsignals/frostdb/query/logicalplan"
+	"github.com/polarsignals/frostdb/recovery"
 )
 
 // TODO: Make this smarter.
@@ -23,6 +26,7 @@ type PhysicalPlan interface {
 	Finish(ctx context.Context) error
 	SetNext(next PhysicalPlan)
 	Draw() *Diagram
+	Close()
 }
 
 type ScanPhysicalPlan interface {
@@ -76,6 +80,8 @@ func (e *OutputPlan) Finish(_ context.Context) error {
 	return nil
 }
 
+func (e *OutputPlan) Close() {}
+
 func (e *OutputPlan) SetNext(_ PhysicalPlan) {
 	// OutputPlan should be the last step.
 	// If this gets called we're doing something wrong.
@@ -118,30 +124,42 @@ func (s *TableScan) Execute(ctx context.Context, pool memory.Allocator) error {
 	for _, plan := range s.plans {
 		callbacks = append(callbacks, plan.Callback)
 	}
+	defer func() { // Close all plans to ensure memory cleanup.
+		for _, plan := range s.plans {
+			plan.Close()
+		}
+	}()
 
-	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
-		return table.Iterator(
-			ctx,
-			tx,
-			pool,
-			callbacks,
-			logicalplan.WithPhysicalProjection(s.options.PhysicalProjection...),
-			logicalplan.WithProjection(s.options.Projection...),
-			logicalplan.WithFilter(s.options.Filter),
-			logicalplan.WithDistinctColumns(s.options.Distinct...),
-		)
-	})
-	if err != nil {
+	opts := []logicalplan.Option{
+		logicalplan.WithPhysicalProjection(s.options.PhysicalProjection...),
+		logicalplan.WithProjection(s.options.Projection...),
+		logicalplan.WithFilter(s.options.Filter),
+		logicalplan.WithDistinctColumns(s.options.Distinct...),
+		logicalplan.WithReadMode(s.options.ReadMode),
+	}
+
+	errg, _ := errgroup.WithContext(ctx)
+	errg.Go(recovery.Do(func() error {
+		return table.View(ctx, func(ctx context.Context, tx uint64) error {
+			return table.Iterator(
+				ctx,
+				tx,
+				pool,
+				callbacks,
+				opts...,
+			)
+		})
+	}))
+	if err := errg.Wait(); err != nil {
 		return err
 	}
 
-	errg, ctx := errgroup.WithContext(ctx)
-
+	errg, _ = errgroup.WithContext(ctx)
 	for _, plan := range s.plans {
 		plan := plan
-		errg.Go(func() error {
+		errg.Go(recovery.Do(func() (err error) {
 			return plan.Finish(ctx)
-		})
+		}))
 	}
 
 	return errg.Wait()
@@ -154,11 +172,15 @@ type SchemaScan struct {
 }
 
 func (s *SchemaScan) Draw() *Diagram {
-	// var children []*Diagram
-	// for _, plan := range s.plans {
-	//	children = append(children, plan.Draw())
-	// }
-	return &Diagram{Details: "SchemaScan"}
+	details := "SchemaScan"
+	var child *Diagram
+	if children := len(s.plans); children > 0 {
+		child = s.plans[0].Draw()
+		if children > 1 {
+			details += " [concurrent]"
+		}
+	}
+	return &Diagram{Details: details, Child: child}
 }
 
 func (s *SchemaScan) Execute(ctx context.Context, pool memory.Allocator) error {
@@ -172,29 +194,36 @@ func (s *SchemaScan) Execute(ctx context.Context, pool memory.Allocator) error {
 		callbacks = append(callbacks, plan.Callback)
 	}
 
-	err = table.View(ctx, func(ctx context.Context, tx uint64) error {
-		return table.SchemaIterator(
-			ctx,
-			tx,
-			pool,
-			callbacks,
-			logicalplan.WithPhysicalProjection(s.options.PhysicalProjection...),
-			logicalplan.WithProjection(s.options.Projection...),
-			logicalplan.WithFilter(s.options.Filter),
-			logicalplan.WithDistinctColumns(s.options.Distinct...),
-		)
-	})
-	if err != nil {
+	opts := []logicalplan.Option{
+		logicalplan.WithPhysicalProjection(s.options.PhysicalProjection...),
+		logicalplan.WithProjection(s.options.Projection...),
+		logicalplan.WithFilter(s.options.Filter),
+		logicalplan.WithDistinctColumns(s.options.Distinct...),
+		logicalplan.WithReadMode(s.options.ReadMode),
+	}
+
+	errg, _ := errgroup.WithContext(ctx)
+	errg.Go(recovery.Do(func() error {
+		return table.View(ctx, func(ctx context.Context, tx uint64) error {
+			return table.SchemaIterator(
+				ctx,
+				tx,
+				pool,
+				callbacks,
+				opts...,
+			)
+		})
+	}))
+	if err := errg.Wait(); err != nil {
 		return err
 	}
 
-	errg, ctx := errgroup.WithContext(ctx)
-
+	errg, _ = errgroup.WithContext(ctx)
 	for _, plan := range s.plans {
 		plan := plan
-		errg.Go(func() error {
+		errg.Go(recovery.Do(func() error {
 			return plan.Finish(ctx)
-		})
+		}))
 	}
 
 	return errg.Wait()
@@ -202,6 +231,10 @@ func (s *SchemaScan) Execute(ctx context.Context, pool memory.Allocator) error {
 
 type noopOperator struct {
 	next PhysicalPlan
+}
+
+func (p *noopOperator) Close() {
+	p.next.Close()
 }
 
 func (p *noopOperator) Callback(ctx context.Context, r arrow.Record) error {
@@ -226,9 +259,16 @@ func (p *noopOperator) Draw() *Diagram {
 type execOptions struct {
 	orderedAggregations bool
 	overrideInput       []PhysicalPlan
+	readMode            logicalplan.ReadMode
 }
 
 type Option func(o *execOptions)
+
+func WithReadMode(m logicalplan.ReadMode) Option {
+	return func(o *execOptions) {
+		o.readMode = m
+	}
+}
 
 func WithOrderedAggregations() Option {
 	return func(o *execOptions) {
@@ -268,7 +308,7 @@ func Build(
 	if s != nil {
 		// TODO(asubiotto): There are cases in which the schema can be nil.
 		// Eradicate these.
-		oInfo.sortingCols = s.SortingColumns()
+		oInfo.sortingCols = s.ColumnDefinitionsForSortingColumns()
 	}
 
 	var visitErr error
@@ -283,6 +323,7 @@ func Build(
 			for i := range plans {
 				plans[i] = &noopOperator{}
 			}
+			plan.SchemaScan.ReadMode = execOpts.readMode
 			outputPlan.scan = &SchemaScan{
 				tracer:  tracer,
 				options: plan.SchemaScan,
@@ -297,6 +338,7 @@ func Build(
 			for i := range plans {
 				plans[i] = &noopOperator{}
 			}
+			plan.TableScan.ReadMode = execOpts.readMode
 			outputPlan.scan = &TableScan{
 				tracer:  tracer,
 				options: plan.TableScan,
@@ -305,6 +347,11 @@ func Build(
 			prev = append(prev[:0], plans...)
 			oInfo.nodeMaintainsOrdering()
 		case plan.Projection != nil:
+			for _, e := range plan.Projection.Exprs { // Don't build the projection if it's a wildcard, the projection pushdown optimization will handle it.
+				if e.Name() == "all" {
+					return true
+				}
+			}
 			// For each previous physical plan create one Projection
 			for i := range prev {
 				p, err := Project(pool, tracer, plan.Projection.Exprs)
@@ -333,6 +380,36 @@ func Build(
 				// Plan a distinct operator to run a distinct on all the
 				// synchronized distincts.
 				d := Distinct(pool, tracer, plan.Distinct.Exprs)
+				sync.SetNext(d)
+				prev = prev[0:1]
+				prev[0] = d
+			}
+		case plan.Limit != nil:
+			var sync *Synchronizer
+			if len(prev) > 1 {
+				// These limit operators need to be synchronized.
+				sync = Synchronize(len(prev))
+			}
+			for i := 0; i < len(prev); i++ {
+				d, err := Limit(pool, tracer, plan.Limit.Expr)
+				if err != nil {
+					visitErr = err
+					return false
+				}
+				prev[i].SetNext(d)
+				prev[i] = d
+				if sync != nil {
+					d.SetNext(sync)
+				}
+			}
+			if sync != nil {
+				// Plan a limit operator to run a limit on all the
+				// synchronized limits.
+				d, err := Limit(pool, tracer, plan.Limit.Expr)
+				if err != nil {
+					visitErr = err
+					return false
+				}
 				sync.SetNext(d)
 				prev = prev[0:1]
 				prev[0] = d
@@ -367,8 +444,9 @@ func Build(
 					sync = Synchronize(len(prev))
 				}
 			}
+			seed := maphash.MakeSeed()
 			for i := 0; i < len(prev); i++ {
-				a, err := Aggregate(pool, tracer, plan.Aggregation, sync == nil, ordered)
+				a, err := Aggregate(pool, tracer, plan.Aggregation, sync == nil, ordered, seed)
 				if err != nil {
 					visitErr = err
 					return false
@@ -382,7 +460,7 @@ func Build(
 			if sync != nil {
 				// Plan an aggregate operator to run an aggregation on all the
 				// aggregations.
-				a, err := Aggregate(pool, tracer, plan.Aggregation, true, ordered)
+				a, err := Aggregate(pool, tracer, plan.Aggregation, true, ordered, seed)
 				if err != nil {
 					visitErr = err
 					return false
@@ -393,6 +471,21 @@ func Build(
 			}
 			if ordered {
 				oInfo.nodeMaintainsOrdering()
+			}
+		case plan.Sample != nil:
+			v := plan.Sample.Expr.(*logicalplan.LiteralExpr).Value.(*scalar.Int64).Value
+			limit := plan.Sample.Limit.(*logicalplan.LiteralExpr).Value.(*scalar.Int64).Value
+			perSampler := v / int64(len(prev))
+			perSamplerLimit := limit / int64(len(prev))
+			r := v % int64(len(prev))
+			for i := range prev {
+				adjust := int64(0)
+				if i < int(r) {
+					adjust = 1
+				}
+				s := NewReservoirSampler(perSampler+adjust, perSamplerLimit, pool)
+				prev[i].SetNext(s)
+				prev[i] = s
 			}
 		default:
 			panic("Unsupported plan")

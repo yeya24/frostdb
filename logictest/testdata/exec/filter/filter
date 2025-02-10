@@ -8,6 +8,38 @@ value3  value2  null    value4  stack1  3   3
 ----
 
 exec
+select labels, stacktrace, timestamp, value where timestamp = 2
+----
+value2  value2  value3  null    stack1  2       2
+
+exec
+select labels, stacktrace, timestamp, value where timestamp != 2
+----
+value1  value2  null    null    stack1  1       1
+value3  value2  null    value4  stack1  3       3
+
+exec
+select labels, stacktrace, timestamp, value where timestamp < 2
+----
+value1  value2  null    null    stack1  1       1
+
+exec
+select labels, stacktrace, timestamp, value where timestamp <= 2
+----
+value1  value2  null    null    stack1  1       1
+value2  value2  value3  null    stack1  2       2
+
+exec
+select labels, stacktrace, timestamp, value where timestamp <= 2 limit 1
+----
+value1  value2  null    null    stack1  1       1
+
+exec
+select labels, stacktrace, timestamp, value where timestamp > 2
+----
+value3  value2  null    value4  stack1  3       3
+
+exec
 select labels, stacktrace, timestamp, value where timestamp >= 2
 ----
 value2  value2  value3  null    stack1  2       2
@@ -112,3 +144,48 @@ exec
 select labels, stacktrace, timestamp, value where labels.label4 != null
 ----
 value3  value2  null    value4  stack1  3       3
+
+# filter column that doesn't exist
+exec
+select labels, timestamp, value where doesntexist > 4
+----
+
+exec
+select labels, timestamp, value where doesntexist < 4
+----
+
+exec
+select labels, timestamp, value where doesntexist >= 4
+----
+
+exec
+select labels, timestamp, value where doesntexist <= 4
+----
+
+exec
+select stacktrace, value where stacktrace like 'ack'
+----
+stack1  1
+stack1  2
+stack1  3
+
+exec
+select stacktrace, value where stacktrace like 'ack2'
+----
+
+exec
+select stacktrace, value where stacktrace not like 'ack'
+----
+
+exec
+select stacktrace, value where stacktrace not like 'ack2'
+----
+stack1  1
+stack1  2
+stack1  3
+
+exec
+select stacktrace, value where labels.label1 not like 'ue2' and stacktrace like 'ack'
+----
+stack1  1
+stack1  3
